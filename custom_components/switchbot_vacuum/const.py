@@ -8,6 +8,7 @@ CONF_USERNAME: Final = "username"
 CONF_PASSWORD: Final = "password"
 CONF_DEVICE_MAC: Final = "device_mac"
 CONF_PRODUCT_KEY: Final = "product_key"
+CONF_GROUP_ID: Final = "group_id"
 
 # API
 API_AUTH_HOST: Final = "https://account.api.switchbot.net"
@@ -17,9 +18,18 @@ API_TIMEOUT: Final = 30
 DEVICE_TYPE_S10: Final = "WoSweeperOrigin"
 DEVICE_TYPE_K10: Final = "WoSweeperMini"
 DEVICE_TYPE_K10PRO: Final = "WoSweeperMiniPro"
-SUPPORTED_DEVICE_TYPES: Final = {DEVICE_TYPE_S10, DEVICE_TYPE_K10, DEVICE_TYPE_K10PRO}
+DEVICE_TYPE_S1: Final = "WoSweeper"
+DEVICE_TYPE_S1_PLUS: Final = "WoSweeperPlus"
+S1_DEVICE_TYPES: Final = frozenset({DEVICE_TYPE_S1, DEVICE_TYPE_S1_PLUS})
+S1_PRODUCT_KEYS: Final = {
+    DEVICE_TYPE_S1: "189c56a889be",
+    DEVICE_TYPE_S1_PLUS: "0f698f178cba",
+}
+SUPPORTED_DEVICE_TYPES: Final = {DEVICE_TYPE_S10, DEVICE_TYPE_K10, DEVICE_TYPE_K10PRO} | S1_DEVICE_TYPES
 
 DEVICE_TYPE_TO_MODEL: Final = {
+    DEVICE_TYPE_S1: "Robot Vacuum Cleaner S1",
+    DEVICE_TYPE_S1_PLUS: "Robot Vacuum Cleaner S1 Plus",
     DEVICE_TYPE_S10: "Floor Cleaning Robot S10",
     DEVICE_TYPE_K10: "Mini Robot Vacuum K10+",
     DEVICE_TYPE_K10PRO: "Mini Robot Vacuum K10+ Pro",

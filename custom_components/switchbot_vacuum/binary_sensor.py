@@ -11,7 +11,7 @@ from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import DOMAIN, ERROR_CODES, NON_ERROR_STATUS_CODES, WORK_STATUS_FAULT
+from .const import DOMAIN, ERROR_CODES, NON_ERROR_STATUS_CODES, S1_DEVICE_TYPES, WORK_STATUS_FAULT
 from .coordinator import SwitchBotS10Coordinator
 
 
@@ -22,6 +22,8 @@ async def async_setup_entry(
 ) -> None:
     """Set up binary sensor entities."""
     coordinator: SwitchBotS10Coordinator = hass.data[DOMAIN][entry.entry_id]
+    if entry.data.get("device_type") in S1_DEVICE_TYPES:
+        return
     async_add_entities([SwitchBotVacuumProblem(coordinator)])
 
 

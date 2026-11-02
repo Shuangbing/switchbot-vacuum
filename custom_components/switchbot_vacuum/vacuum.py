@@ -43,9 +43,11 @@ from .const import (
     K10_WORK_STATUS_GO_CHARGE,
     K10_WORK_STATUS_PAUSED,
     K10_WORK_STATUS_STANDBY,
+    S1_DEVICE_TYPES,
 )
 from .coordinator import SwitchBotS10Coordinator
 from .k10_api import K10ProtocolError
+from .s1_api import S1ProtocolError, validate_passes
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -62,8 +64,33 @@ K10_STATUS_TO_ACTIVITY = {
     K10_WORK_STATUS_COLLECTING_DUST: VacuumActivity.DOCKED,  # 11 isCollectingDust
 }
 
+# VacuumUtil.getDesText/isCleaning/isDocking in Android 9.11.15.13.
+S1_STATUS_TO_ACTIVITY = {
+    0: VacuumActivity.IDLE,
+    1: VacuumActivity.CLEANING,
+    2: VacuumActivity.CLEANING,
+    3: VacuumActivity.CLEANING,
+    4: VacuumActivity.PAUSED,
+    5: VacuumActivity.RETURNING,
+    6: VacuumActivity.DOCKED,
+    7: VacuumActivity.DOCKED,
+    8: VacuumActivity.IDLE,
+    9: VacuumActivity.ERROR,
+    10: VacuumActivity.CLEANING,  # remote control
+    11: VacuumActivity.DOCKED,   # dust collection
+    31: VacuumActivity.CLEANING, # quick mapping
+}
+
+
+def _passes_schema(value: Any) -> int:
+    try:
+        return validate_passes(value)
+    except S1ProtocolError as exc:
+        raise vol.Invalid(str(exc)) from None
+
 # S10 native work_status values -> HA activity (confirmed from real API + APK SweeperUtil.smali)
 S10_STATUS_TO_ACTIVITY = {
+    1: VacuumActivity.IDLE,     # standby
     2: VacuumActivity.DOCKED,    # charging ✓
     3: VacuumActivity.DOCKED,    # charge done
     4: VacuumActivity.CLEANING,  # launching
@@ -128,6 +155,10 @@ async def async_setup_entry(
         {},
         "async_force_refresh",
     )
+    platform.async_register_entity_service(
+        "set_cleaning_passes", {vol.Required("times"): _passes_schema},
+        "async_set_cleaning_passes",
+    )
 
 
 class SwitchBotS10Vacuum(CoordinatorEntity[SwitchBotS10Coordinator], StateVacuumEntity):
@@ -141,7 +172,6 @@ class SwitchBotS10Vacuum(CoordinatorEntity[SwitchBotS10Coordinator], StateVacuum
         | VacuumEntityFeature.RETURN_HOME
         | VacuumEntityFeature.FAN_SPEED
         | VacuumEntityFeature.SEND_COMMAND
-        | VacuumEntityFeature.BATTERY
     )
     def __init__(self, coordinator: SwitchBotS10Coordinator) -> None:
         """Initialize."""
@@ -149,9 +179,15 @@ class SwitchBotS10Vacuum(CoordinatorEntity[SwitchBotS10Coordinator], StateVacuum
         self._attr_unique_id = f"{coordinator.device_mac}_vacuum"
         self._attr_name = coordinator.device_name or "SwitchBot Vacuum"
         device_type = coordinator.entry.data.get("device_type", DEVICE_TYPE_S10)
+        self._is_s1 = device_type in S1_DEVICE_TYPES
         self._is_k10 = device_type == DEVICE_TYPE_K10
-        self._attr_fan_speed_list = K10_FAN_SPEED_LIST if self._is_k10 else FAN_SPEED_LIST
         self._is_k10_pro = device_type == DEVICE_TYPE_K10PRO
+        self._attr_fan_speed_list = (
+            K10_FAN_SPEED_LIST if self._is_s1 or self._is_k10 or self._is_k10_pro
+            else FAN_SPEED_LIST
+        )
+        if self._is_s1:
+            self._attr_supported_features &= ~VacuumEntityFeature.SEND_COMMAND
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, coordinator.device_mac)},
             name=coordinator.device_name or "SwitchBot Vacuum",
@@ -161,10 +197,20 @@ class SwitchBotS10Vacuum(CoordinatorEntity[SwitchBotS10Coordinator], StateVacuum
         )
 
     @property
+    def available(self) -> bool:
+        """S1 is available only with a confirmed online status."""
+        return super().available and (
+            not self._is_s1 or self.coordinator.data.get("online") is True
+        )
+
+    @property
     def activity(self) -> VacuumActivity | None:
         """Return current activity."""
         status = self.coordinator.data.get("work_status", 0)
-        if self._is_k10 or self._is_k10_pro:
+        if self._is_s1:
+            status = self.coordinator.data.get("work_status")
+            activity = S1_STATUS_TO_ACTIVITY.get(status)
+        elif self._is_k10 or self._is_k10_pro:
             activity = K10_STATUS_TO_ACTIVITY.get(status)
         else:
             activity = S10_STATUS_TO_ACTIVITY.get(status)
@@ -181,6 +227,9 @@ class SwitchBotS10Vacuum(CoordinatorEntity[SwitchBotS10Coordinator], StateVacuum
     def fan_speed(self) -> str | None:
         """Return current fan speed."""
         mode = self.coordinator.data.get("clean_mode", {})
+        if self._is_s1:
+            level = mode.get("fan_level") if isinstance(mode, dict) else None
+            return K10_FAN_LEVEL_TO_SPEED.get(level) if type(level) is int else None
         if self._is_k10 or self._is_k10_pro:
             level = mode.get("fan_level", 0) if isinstance(mode, dict) else 0
             return K10_FAN_LEVEL_TO_SPEED.get(level, "quiet")
@@ -195,20 +244,22 @@ class SwitchBotS10Vacuum(CoordinatorEntity[SwitchBotS10Coordinator], StateVacuum
         attrs: dict[str, Any] = {}
 
         if isinstance(mode, dict):
-            attrs["times"] = mode.get("times", 1)
+            attrs["times"] = mode.get("times") if self._is_s1 else mode.get("times", 1)
         if self._is_k10 and isinstance(mode, dict):
             attrs["clean_type"] = mode.get("type")
             attrs["mopping_pad_installed"] = self.coordinator.data.get("mopping_pad_installed")
-        if not self._is_k10 and not self._is_k10_pro and isinstance(mode, dict):
+        if not self._is_s1 and not self._is_k10 and not self._is_k10_pro and isinstance(mode, dict):
             attrs["water_level"] = mode.get("water_level", 1)
             attrs["clean_type"] = mode.get("type", "sweep_mop")
 
-        if not self._is_k10 and not self._is_k10_pro and isinstance(summary, dict):
+        if not self._is_s1 and not self._is_k10 and not self._is_k10_pro and isinstance(summary, dict):
             attrs["last_clean_area"] = summary.get("clean_area", 0)
             attrs["last_clean_time"] = summary.get("clean_time", 0)
 
         attrs["work_status"] = self.coordinator.data.get("work_status", 0)
         attrs["rooms"] = self.coordinator.data.get("rooms", {})
+        if self._is_s1:
+            attrs["error_code"] = self.coordinator.data.get("error_code")
         return attrs
 
     def _optimistic_update(self, work_status: int) -> None:
@@ -219,6 +270,9 @@ class SwitchBotS10Vacuum(CoordinatorEntity[SwitchBotS10Coordinator], StateVacuum
 
     async def async_start(self) -> None:
         """Start cleaning."""
+        if self._is_s1:
+            await self.coordinator.async_s1_control("start")
+            return
         if self._is_k10 or self._is_k10_pro:
             await self.coordinator.async_send_action(
                 "StartDefaultClean", {"CleanTimes": 1}
@@ -244,6 +298,9 @@ class SwitchBotS10Vacuum(CoordinatorEntity[SwitchBotS10Coordinator], StateVacuum
 
     async def async_stop(self, **kwargs: Any) -> None:
         """Stop cleaning."""
+        if self._is_s1:
+            await self.coordinator.async_s1_control("pause")
+            return
         if self._is_k10 or self._is_k10_pro:
             await self.coordinator.async_send_action("PauseRobot")
             self._optimistic_update(K10_WORK_STATUS_PAUSED)
@@ -253,6 +310,9 @@ class SwitchBotS10Vacuum(CoordinatorEntity[SwitchBotS10Coordinator], StateVacuum
 
     async def async_pause(self) -> None:
         """Pause cleaning."""
+        if self._is_s1:
+            await self.coordinator.async_s1_control("pause")
+            return
         if self._is_k10 or self._is_k10_pro:
             await self.coordinator.async_send_action("PauseRobot")
             self._optimistic_update(K10_WORK_STATUS_PAUSED)
@@ -262,6 +322,9 @@ class SwitchBotS10Vacuum(CoordinatorEntity[SwitchBotS10Coordinator], StateVacuum
 
     async def async_return_to_base(self, **kwargs: Any) -> None:
         """Return to charging base."""
+        if self._is_s1:
+            await self.coordinator.async_s1_control("dock")
+            return
         if self._is_k10 or self._is_k10_pro:
             await self.coordinator.async_send_action("ReturnChargeBase")
             self._optimistic_update(K10_WORK_STATUS_GO_CHARGE)
@@ -271,6 +334,11 @@ class SwitchBotS10Vacuum(CoordinatorEntity[SwitchBotS10Coordinator], StateVacuum
 
     async def async_set_fan_speed(self, fan_speed: str, **kwargs: Any) -> None:
         """Set fan speed."""
+        if self._is_s1:
+            if fan_speed not in K10_FAN_SPEEDS:
+                raise HomeAssistantError("Unsupported S1 fan speed")
+            await self.coordinator.async_s1_control("suction", K10_FAN_SPEEDS[fan_speed])
+            return
         if self._is_k10:
             if fan_speed not in K10_FAN_SPEEDS:
                 raise HomeAssistantError("Unsupported K10+ fan speed")
@@ -298,6 +366,8 @@ class SwitchBotS10Vacuum(CoordinatorEntity[SwitchBotS10Coordinator], StateVacuum
         self, command: str, params: dict[str, Any] | list[Any] | None = None, **kwargs: Any
     ) -> None:
         """Send a raw command."""
+        if self._is_s1:
+            raise HomeAssistantError("S1 does not use numeric function commands")
         if params and isinstance(params, dict):
             func_id = params.get("function_id", CMD_CLEAN)
             cmd_params = params.get("params", {})
@@ -313,6 +383,8 @@ class SwitchBotS10Vacuum(CoordinatorEntity[SwitchBotS10Coordinator], StateVacuum
         force_order: bool = True,
     ) -> None:
         """Clean specific rooms. Accepts room IDs or names."""
+        if self._is_s1:
+            raise HomeAssistantError("S1 room cleaning is not implemented; no cleaning started")
         if self._is_k10:
             if water_level is not None or mode not in (None, "sweep", "mop"):
                 raise HomeAssistantError(
@@ -360,6 +432,12 @@ class SwitchBotS10Vacuum(CoordinatorEntity[SwitchBotS10Coordinator], StateVacuum
                 },
             })
         await self.coordinator.async_request_refresh()
+
+    async def async_set_cleaning_passes(self, times: int) -> None:
+        """Set S1 device passes without starting a cleaning task."""
+        if not self._is_s1:
+            raise HomeAssistantError("Cleaning passes setting is only supported for S1/S1 Plus")
+        await self.coordinator.async_s1_control("passes", times)
 
     async def async_force_refresh(self) -> None:
         """Force refresh status and room data."""

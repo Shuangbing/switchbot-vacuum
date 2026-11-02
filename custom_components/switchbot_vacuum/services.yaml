@@ -54,6 +54,25 @@ clean_rooms:
       selector:
         boolean:
 
+set_cleaning_passes:
+  name: "Set cleaning passes"
+  description: "S1/S1 Plus only. Set WorkRepeatTimes and require cloud readback. Does not start cleaning; finish the current task first."
+  target:
+    entity:
+      domain: vacuum
+      integration: switchbot_vacuum
+  fields:
+    times:
+      name: "Passes"
+      required: true
+      example: 2
+      selector:
+        number:
+          min: 1
+          max: 2
+          step: 1
+          mode: box
+
 force_refresh:
   name: "Force Refresh"
   description: "Force refresh device status and room data from the cloud map"

@@ -11,7 +11,7 @@
       },
       "device": {
         "title": "Select Device",
-        "description": "Multiple S10 vacuums found. Select the one to add.",
+        "description": "Multiple SwitchBot vacuums found. Select the one to add.",
         "data": {
           "device_mac": "Device"
         }
@@ -39,6 +39,18 @@
     },
     "abort": {
       "unique_id_mismatch": "The authenticated device does not match the existing vacuum."
+    }
+  },
+  "entity": {
+    "select": {
+      "cleaning_passes": {
+        "name": "Cleaning passes"
+      }
+    },
+    "sensor": {
+      "battery": {
+        "name": "Battery"
+      }
     }
   }
 }

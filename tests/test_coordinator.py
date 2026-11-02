@@ -66,6 +66,11 @@ class TestLogin:
                 "refresh_token": "test_refresh",
             }
         })
+        resp.json.side_effect = [
+            {"body": {"access_token": "test_jwt_token"}},
+            {"body": {"botRegion": "JP"}},
+            {"data": [{"name": "wonderlabs", "host": "https://wonderlabs.jp.api.switchbot.net"}]},
+        ]
         with _patch_session(resp):
             coordinator = SwitchBotS10Coordinator(mock_hass, mock_entry)
             await coordinator.async_login()

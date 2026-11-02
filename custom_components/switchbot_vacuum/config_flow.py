@@ -12,6 +12,7 @@ from homeassistant.exceptions import ConfigEntryAuthFailed
 
 from .const import (
     CONF_DEVICE_MAC,
+    CONF_GROUP_ID,
     CONF_PASSWORD,
     CONF_PRODUCT_KEY,
     CONF_USERNAME,
@@ -74,6 +75,7 @@ class SwitchBotS10ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                             CONF_DEVICE_MAC: device["device_mac"],
                             "device_type": device.get("device_type", DEVICE_TYPE_S10),
                             CONF_PRODUCT_KEY: device.get("product_key", ""),
+                            **({CONF_GROUP_ID: device["group_id"]} if device.get("group_id") else {}),
                         },
                     )
                 else:
@@ -105,6 +107,7 @@ class SwitchBotS10ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         CONF_DEVICE_MAC: device_mac,
                         "device_type": device.get("device_type", DEVICE_TYPE_S10),
                         CONF_PRODUCT_KEY: device.get("product_key", ""),
+                        **({CONF_GROUP_ID: device["group_id"]} if device.get("group_id") else {}),
                     },
                 )
 

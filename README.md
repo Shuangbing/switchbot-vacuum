@@ -1,6 +1,66 @@
 # SwitchBot Vacuum for Home Assistant
 
-Custom [HACS](https://hacs.xyz/) integration for SwitchBot robot vacuums (S10 and compatible models) in Home Assistant.
+Custom [HACS](https://hacs.xyz/) integration for SwitchBot robot vacuums, including experimental S1/S1 Plus support.
+
+## S1 / S1 Plus (experimental, v0.5.0)
+
+S1 (`WoSweeper`) and S1 Plus (`WoSweeperPlus`) are now discovered through the
+existing SwitchBot **account email/password** setup. Public OpenAPI Token/Secret
+credentials from the built-in SwitchBot Cloud integration are not used here.
+You may keep the built-in integration installed; target this custom integration's
+vacuum entity in the actions below.
+
+- Separate S1 named-property/status branch, rather than S10 numeric shadow IDs.
+- Start, pause/stop, return to base, four suction levels, and a battery sensor.
+- **Cleaning passes / クリーニング回数 / 清扫次数** select with options **1** and **2**.
+- Changing the select writes `WorkRepeatTimes` and checks cloud readback. It never
+  starts cleaning. Finish the current task before changing it (paused tasks count
+  as active); standby, charging, charged, or dormant states are accepted.
+- `vacuum.start` reads the current count and explicitly sends
+  `StartDefaultClean` with `CleanTimes: 1` or `2`. It no longer forces one pass.
+- If the proxy omits the count, the select remains **unknown**, not a fabricated
+  one pass. Starting is blocked until the count can be read; a failed write or
+  unconfirmed readback is reported as an error rather than optimistic success.
+- S1 room cleaning, map download, cleaning-mode switching, S10 summary metrics,
+  and model-specific error descriptions are **not implemented**. A room-cleaning
+  request is rejected, never replaced with a whole-house cleaning request.
+
+Set passes from an automation without starting the robot:
+
+```yaml
+action: switchbot_vacuum.set_cleaning_passes
+target:
+  entity_id: vacuum.your_s1
+data:
+  times: 2
+```
+
+Start separately after a confirmed setting:
+
+```yaml
+action: vacuum.start
+target:
+  entity_id: vacuum.your_s1
+```
+
+The S1 branch uses the account-discovered regional SwitchBot
+`/wonder/sweeper360/v1/device/getInfo`, `setInfo`, and `setAction` proxies. It does
+not assume that a Japanese S1 uses the EU-only K10 delegated API. This is based
+on static analysis of SwitchBot Android **9.11.15.13**; **S1 hardware, proxy
+acceptance of `WorkRepeatTimes`, and actual two-pass cleaning have not yet been
+tested**. Readback guards make missing/unsupported cloud behavior visible, not
+proof that the robot completed two passes. See [protocol evidence and validation](docs/s1-protocol.md).
+
+To use these fork changes, install the local `custom_components/switchbot_vacuum`
+directory or, **after publishing this fork**, use
+`https://github.com/Shuangbing/switchbot-vacuum` as the HACS custom repository.
+Restart Home Assistant, add **SwitchBot Vacuum**, sign in, then select the S1.
+If updating an existing entry, reload it so the new entities appear.
+
+Battery is now a linked sensor for all models, compatible with Home Assistant
+2026.8+ (the removed `VacuumEntityFeature.BATTERY` flag is no longer referenced).
+The legacy `battery_level` property remains for older consumers, but new
+dashboards/automations should use the battery sensor.
 
 ## Why this exists
 

@@ -1,6 +1,7 @@
 """Data update coordinator for SwitchBot Vacuum."""
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import logging
@@ -17,22 +18,28 @@ from homeassistant.exceptions import ConfigEntryAuthFailed, HomeAssistantError
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .k10_api import CLEAN_MODES, WONDER, K10Api, K10ProtocolError, room_names
-
 from .const import (
     API_AUTH_HOST,
     API_TIMEOUT,
     APP_VERSION,
     CLIENT_ID,
     CONF_DEVICE_MAC,
+    CONF_GROUP_ID,
     CONF_PASSWORD,
     CONF_PRODUCT_KEY,
     CONF_USERNAME,
     DEVICE_TYPE_K10,
     DEVICE_TYPE_K10PRO,
-    SUPPORTED_DEVICE_TYPES,
     DOMAIN,
     K10_WORK_STATUS_STANDBY,
+    K10PRO_PROP_AUTO_RESTART,
+    K10PRO_PROP_BATTERY,
+    K10PRO_PROP_CHILD_LOCK,
+    K10PRO_PROP_DUST_COLECT_FREQUENCY,
+    K10PRO_PROP_DUST_COLECT_TIME,
+    K10PRO_PROP_ONLINE,
+    K10PRO_PROP_SUCTION_POW_LEVEL,
+    K10PRO_PROP_WORK_STATUS,
     PROP_AWS_CREDS,
     PROP_BATTERY,
     PROP_CLEAN_MODE,
@@ -44,18 +51,16 @@ from .const import (
     PROP_ROOM_PLANS,
     PROP_S3_BUCKET,
     PROP_WORK_STATUS,
-    K10PRO_PROP_ONLINE,
-    K10PRO_PROP_BATTERY,
-    K10PRO_PROP_SUCTION_POW_LEVEL,
-    K10PRO_PROP_WORK_STATUS,
-    K10PRO_PROP_DUST_COLECT_FREQUENCY,
-    K10PRO_PROP_CHILD_LOCK,
-    K10PRO_PROP_DUST_COLECT_TIME,
-    K10PRO_PROP_AUTO_RESTART,
+    S1_DEVICE_TYPES,
+    S1_PRODUCT_KEYS,
     S3_REGION,
+    SUPPORTED_DEVICE_TYPES,
     TOKEN_REFRESH_SECONDS,
     UPDATE_INTERVAL_SECONDS,
 )
+from .k10_api import CLEAN_MODES, WONDER, K10Api, K10ProtocolError, room_names
+from .s1_api import S1Api, S1ProtocolError, reported_passes, validate_passes
+
 _LOGGER = logging.getLogger(__name__)
 
 STATUS_PROPS = [PROP_ONLINE, PROP_BATTERY, PROP_WORK_STATUS, PROP_ERROR_CODE,
@@ -95,6 +100,7 @@ class SwitchBotS10Coordinator(DataUpdateCoordinator):
         self._last_room_refresh: float = 0
         self._k10_api: K10Api | None = None
         self._k10_group_id: str | None = None
+        self._s1_lock = asyncio.Lock()
 
         super().__init__(
             hass,
@@ -107,6 +113,102 @@ class SwitchBotS10Coordinator(DataUpdateCoordinator):
     def _is_k10(self) -> bool:
         """Return True if device is K10+."""
         return self.entry.data.get("device_type") == DEVICE_TYPE_K10
+
+    def _is_s1(self) -> bool:
+        """S1 uses named properties, not the S10 numeric shadow protocol."""
+        return self.entry.data.get("device_type") in S1_DEVICE_TYPES
+
+    async def _s1_client(self) -> S1Api:
+        await self._ensure_token()
+        if not self._is_s1() or not self.device_mac or not self.wonderlab_endpoint:
+            raise S1ProtocolError("Select an S1 device before using S1 controls")
+        product_key = self.entry.data.get(CONF_PRODUCT_KEY) or S1_PRODUCT_KEYS[
+            self.entry.data["device_type"]
+        ]
+        return S1Api(
+            async_get_clientsession(self.hass), self.wonderlab_endpoint, self._headers(),
+            product_key, self.device_mac, self.entry.data.get(CONF_GROUP_ID),
+        )
+
+    def _s1_invalidate_passes(self) -> None:
+        if self.data:
+            self.async_set_updated_data(self.data | {
+                "clean_mode": self.data.get("clean_mode", {}) | {"times": None}
+            })
+
+    async def async_s1_control(self, command: str, value: int | None = None) -> None:
+        """Serialize setting/start operations; confirm settings, not optimistic state."""
+        if not self._is_s1():
+            raise HomeAssistantError("This action is only supported for S1 and S1 Plus")
+        if command not in ("passes", "suction", "start", "pause", "dock"):
+            raise HomeAssistantError("Unsupported S1 control")
+        if command == "passes":
+            try:
+                validate_passes(value)
+            except S1ProtocolError as exc:
+                raise HomeAssistantError(str(exc)) from None
+        try:
+            async with self._s1_lock:
+                api = await self._s1_client()
+                if command in ("passes", "suction") and not api.group_id:
+                    # Older config entries may not have retained the discovered family.
+                    devices = await self.async_discover_devices()
+                    selected = next((d for d in devices if d["device_mac"] == self.device_mac), {})
+                    api.group_id = selected.get(CONF_GROUP_ID)
+                if command == "passes":
+                    properties = await api.set_cleaning_passes(value)
+                    self.async_set_updated_data(self.data | {
+                        "clean_mode": self.data.get("clean_mode", {}) | {
+                            "times": reported_passes(properties)
+                        }
+                    })
+                    return
+                if command == "suction":
+                    await api.set_properties({"SuctionPowLevel": value})
+                elif command == "start":
+                    await api.start()
+                else:
+                    await api.action({"pause": "PauseRobot", "dock": "ReturnChargeBase"}[command])
+            await self.async_request_refresh()
+        except S1ProtocolError as exc:
+            if command == "passes":
+                self._s1_invalidate_passes()
+            raise HomeAssistantError(str(exc)) from None
+        except (aiohttp.ClientError, TimeoutError, ValueError, KeyError, TypeError) as exc:
+            if command == "passes":
+                self._s1_invalidate_passes()
+            raise HomeAssistantError(
+                f"S1 control failed ({type(exc).__name__}); check the App before retrying"
+            ) from None
+
+    async def _async_update_data_s1(self) -> dict[str, Any]:
+        """Keep basic S1 telemetry even if the proxy omits optional property reads."""
+        try:
+            api = await self._s1_client()
+            status = await api.get_status()
+            properties = {}
+            if status.get("online_status") == "online":
+                try:
+                    properties = await api.get_properties()
+                except (S1ProtocolError, aiohttp.ClientError, TimeoutError, ValueError) as exc:
+                    _LOGGER.debug("S1 optional properties unavailable (%s)", type(exc).__name__)
+            merged = properties | status
+            working_status = merged.get("WorkingStatus")
+            return {
+                "online": status.get("online_status") == "online",
+                "battery": merged.get("BatteryLevel"),
+                "work_status": working_status if type(working_status) is int else None,
+                "error_code": merged.get("ErrorCode"),
+                "clean_mode": {
+                    "fan_level": merged.get("SuctionPowLevel"),
+                    "times": reported_passes(properties),
+                },
+                "clean_summary": {}, "firmware": "", "rooms": {},
+            }
+        except S1ProtocolError as exc:
+            raise UpdateFailed(str(exc)) from None
+        except (aiohttp.ClientError, TimeoutError, ValueError, KeyError, TypeError) as exc:
+            raise UpdateFailed(f"S1 status fetch failed ({type(exc).__name__})") from None
 
     def _is_k10_pro(self) -> bool:
         """Return True if device is K10+."""
@@ -432,6 +534,8 @@ class SwitchBotS10Coordinator(DataUpdateCoordinator):
 
     async def async_refresh_rooms(self) -> None:
         """Refresh rooms — branches per device type."""
+        if self._is_s1():
+            return
         if self._is_k10() or self._is_k10_pro():
             await self.async_refresh_k10_rooms()
             return
@@ -592,6 +696,11 @@ class SwitchBotS10Coordinator(DataUpdateCoordinator):
 
         if not self.device_mac:
             self.device_mac = self.entry.data.get(CONF_DEVICE_MAC)
+
+        if self._is_s1():
+            self.device_name = self.entry.title
+            async with self._s1_lock:
+                return await self._async_update_data_s1()
 
         if self._is_k10():
             return await self._async_update_data_k10()

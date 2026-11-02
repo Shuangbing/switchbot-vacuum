@@ -1,0 +1,14 @@
+{
+  "entity": {
+    "select": {
+      "cleaning_passes": {
+        "name": "清扫次数"
+      }
+    },
+    "sensor": {
+      "battery": {
+        "name": "电池"
+      }
+    }
+  }
+}

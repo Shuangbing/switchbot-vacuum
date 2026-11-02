@@ -11,13 +11,20 @@ from homeassistant.components.sensor import (
     SensorStateClass,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import UnitOfTime
+from homeassistant.const import PERCENTAGE, UnitOfTime
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import DEVICE_TYPE_K10, DEVICE_TYPE_K10PRO, DOMAIN, ERROR_CODES, WORK_STATUS_FAULT
+from .const import (
+    DEVICE_TYPE_K10,
+    DEVICE_TYPE_K10PRO,
+    DOMAIN,
+    ERROR_CODES,
+    S1_DEVICE_TYPES,
+    WORK_STATUS_FAULT,
+)
 from .coordinator import SwitchBotS10Coordinator
 
 _LOGGER = logging.getLogger(__name__)
@@ -79,7 +86,12 @@ async def async_setup_entry(
     coordinator: SwitchBotS10Coordinator = hass.data[DOMAIN][entry.entry_id]
     device_type = entry.data.get("device_type", "")
 
-    entities: list[SensorEntity] = [SwitchBotVacuumError(coordinator)]
+    entities: list[SensorEntity] = [SwitchBotBattery(coordinator)]
+    if device_type in S1_DEVICE_TYPES:
+        # Do not apply S10 summary units or error codes to the S1 protocol.
+        async_add_entities(entities)
+        return
+    entities.append(SwitchBotVacuumError(coordinator))
 
     if device_type not in (DEVICE_TYPE_K10, DEVICE_TYPE_K10PRO):
         entities.extend(
@@ -107,6 +119,30 @@ async def async_setup_entry(
 
     _async_add_new_rooms()
     coordinator.async_add_listener(_async_add_new_rooms)
+
+
+class SwitchBotBattery(CoordinatorEntity[SwitchBotS10Coordinator], SensorEntity):
+    """Battery telemetry, migrated out of the removed vacuum BATTERY feature."""
+
+    _attr_has_entity_name = True
+    _attr_translation_key = "battery"
+    _attr_device_class = SensorDeviceClass.BATTERY
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = PERCENTAGE
+
+    def __init__(self, coordinator: SwitchBotS10Coordinator) -> None:
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{coordinator.device_mac}_battery"
+        self._attr_device_info = DeviceInfo(identifiers={(DOMAIN, coordinator.device_mac)})
+
+    @property
+    def available(self) -> bool:
+        return super().available and bool(self.coordinator.data.get("online", False))
+
+    @property
+    def native_value(self) -> int | None:
+        value = self.coordinator.data.get("battery")
+        return value if type(value) is int and 0 <= value <= 100 else None
 
 
 class SwitchBotRoomSensor(CoordinatorEntity[SwitchBotS10Coordinator], SensorEntity):

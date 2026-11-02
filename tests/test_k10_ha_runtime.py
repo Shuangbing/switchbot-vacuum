@@ -131,7 +131,7 @@ class K10EntityTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(
             [call.args[0] for call in platform.async_register_entity_service.call_args_list],
-            ["clean_rooms", "force_refresh"],
+            ["clean_rooms", "force_refresh", "set_cleaning_passes"],
         )
 
     async def test_service_schema_does_not_inject_s10_options(self):
