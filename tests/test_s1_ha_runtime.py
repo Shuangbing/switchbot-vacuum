@@ -45,6 +45,7 @@ def actual_coordinator():
     coord.device_mac = "AABBCCDDEEFF"
     coord.data = coordinator().data
     coord._s1_lock = asyncio.Lock()
+    coord._uuid = "fake-installation"
     coord._ensure_token = AsyncMock()
     coord.wonderlab_endpoint = "https://wonderlabs.jp.api.switchbot.net"
     coord._headers = MagicMock(return_value={"authorization": "fake-app-token"})
@@ -288,6 +289,61 @@ async def test_regional_client_uses_ha_session_and_apk_product_key():
     assert api.product_key == "189c56a889be"
     assert api.group_id == "family"
     coord._ensure_token.assert_awaited_once()
+
+
+async def test_new_s1_clients_share_the_in_memory_sdk_session():
+    coord = actual_coordinator()
+    with patch.object(module, "async_get_clientsession", return_value=MagicMock()):
+        first = await coord._s1_client()
+        second = await coord._s1_client()
+    assert first is not second
+    assert first.sdk is second.sdk is coord._s1_sdk
+    assert first.sdk.installation_id == "fakeinstallation"
+
+
+async def test_family_discovery_is_optional_for_working_status_reads():
+    coord = actual_coordinator()
+    coord.entry.data.pop("group_id")
+    coord.async_discover_devices = AsyncMock(side_effect=TimeoutError("SECRET"))
+    api = MagicMock(group_id=None)
+    api.get_status = AsyncMock(return_value={
+        "online_status": "online", "WorkingStatus": 7, "BatteryLevel": 100,
+    })
+    api.get_properties = AsyncMock()
+    coord._s1_client = AsyncMock(return_value=api)
+    data = await coord._async_update_data_s1()
+    assert data["battery"] == 100
+    assert data["work_status"] == 7
+    assert data["clean_mode"]["times"] is None
+    api.get_properties.assert_not_awaited()
+
+
+async def test_discovered_family_is_cached_and_used_by_optional_sdk_reads():
+    coord = actual_coordinator()
+    coord.entry.data.pop("group_id")
+    coord.async_discover_devices = AsyncMock(return_value=[
+        {"device_mac": coord.device_mac, "group_id": "selected-family"},
+    ])
+    api = MagicMock(group_id=None)
+    api.get_status = AsyncMock(return_value={"online_status": "online", "WorkingStatus": 7})
+    api.get_properties = AsyncMock(return_value={"WorkRepeatTimes": 2})
+    coord._s1_client = AsyncMock(return_value=api)
+    data = await coord._async_update_data_s1()
+    assert data["clean_mode"]["times"] == 2
+    assert api.group_id == "selected-family"
+    assert await coord._s1_family_id() == "selected-family"
+    coord.async_discover_devices.assert_awaited_once()
+
+
+async def test_constructing_status_client_does_not_discover_or_delegate():
+    coord = actual_coordinator()
+    coord.entry.data.pop("group_id")
+    coord.async_discover_devices = AsyncMock(side_effect=AssertionError("Unexpected discovery"))
+    with patch.object(module, "async_get_clientsession", return_value=MagicMock()):
+        api = await coord._s1_client()
+    assert api.group_id is None
+    assert api.sdk.token is None
+    coord.async_discover_devices.assert_not_awaited()
 
 
 async def test_s1_does_not_create_s10_error_or_summary_sensors():

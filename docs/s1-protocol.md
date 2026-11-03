@@ -19,8 +19,14 @@ Static analysis, not hardware testing:
 | Property transport | `SweeperRepositoryImpl.setIntProperty` (`0x2903b0`) → `TslUseCase.setIntProperty` (`0x28a048`) → TSL remote datasource |
 | SDK HTTP route | `0x1e1ab4`: `/v1/iot/device/set_property`; content type at `0x1e1a7c`: form-urlencoded |
 | Task-specific input | `startDefaultClean` async body: `0x28cc64` loads `CleanTimes`, `0x28ccc0` loads `StartDefaultClean`, `0x28ccd0` calls `TslUseCase.executeService` |
-| Native proxy declarations | Java `DeviceService.getVacuumSettingInfo`, `setVacuumInfo`, `setVacuumAction` |
-| Native proxy payload | `VacuumGetInfoReq`, `VacuumInfoReq` (includes selected family `groupID`), `VacuumActionReq` |
+| SDK region discovery | Java `VacuumUtil` region initialization; `DeviceService`: GET `/wonder/sweeper360/v1/user/getRegion`; first returned `hosts` entry |
+| Delegated authorization | Java `VacuumUtil` / `VacuumTokenRep`; POST `/wonder/sweeper360/v1/auth/applyToken`, selected family `groupID`, `token` and absolute Unix-seconds `valid_time` |
+| Region evidence | Java `RegionConfig`: JP default `ap1-sapp-api.botslab.com`; runtime discovery takes precedence |
+| SDK signing constants | Java `QhsFatSdkManager.initVacuum360Config`, `SdkConfigs` construction: same SDK app key/secret as the existing K10 signer |
+| Signature construction | Dart `CommonParamInterceptor`: AppUtilChannel metadata; `0x27cef0` onward concatenates app key, m2, timestamp, nonce and SDK secret before MD5 |
+| SDK authorization header | Dart `UserSessionStore.get_authorizationString` (`0x1ff06c`), literal `tokens ` at `0x1ff1c4` |
+| SDK property read | Dart `TslRemoteDataSource` at `0x2b9bf0`: `/v1/iot/device/get_property`, GET at `0x2b9bfc` |
+| SDK service call | Dart `TslHttp` at `0x1e1540`: `/v1/iot/device/invoke_service`, form-urlencoded at `0x1e1508` |
 | S1 status values | Java `VacuumUtil.getDesText`, `isCleaning`, `isDocking`, `isGoCharging`, `isWarningOrError` |
 
 The wire count is integer **1/2**, not enum indices 0/1. Setting
@@ -33,34 +39,60 @@ unverified Dart 2.13.4 profile. The critical literals were checked against
 instruction loads, object-pool references and independently recovered string
 IDs; generated Dart pseudocode is not treated as original source.
 
-## Implemented transport
+## Transport correction in v0.5.1
 
-The SDK's direct Botslab endpoint needs delegated credentials and SDK signing.
-The integration instead reuses its existing SwitchBot App login and regional
-endpoint discovery, with these native proxy payloads:
+User hardware evidence: v0.5.0 read docked status and battery successfully, but
+the cleaning-pass selection stayed unknown and its write returned `statusCode
+190`. That code by itself does not establish which server validation failed.
+Native `getInfo`/`setInfo`/`setAction` declarations did not establish that those
+proxies support the S1 SDK's property payload. They are no longer used here.
+
+Keep the existing SwitchBot App login and account-discovered regional endpoint.
+Only basic status uses its native proxy. Follow the APK's regional SDK setup for
+all S1 property reads, writes and actions:
 
 ```text
 POST /wonder/devicestatus/v1/getstatus
 {"items":["DEVICE_MAC"]}
 
-POST /wonder/sweeper360/v1/device/getInfo
-{"productKey":"PRODUCT_KEY","deviceName":"DEVICE_MAC",
- "items":["BatteryLevel","WorkingStatus","SuctionPowLevel","WorkRepeatTimes","ErrorCode"]}
+GET /wonder/sweeper360/v1/user/getRegion
+→ body.hosts[0] selects the SDK host
 
-POST /wonder/sweeper360/v1/device/setInfo
-{"productKey":"PRODUCT_KEY","deviceName":"DEVICE_MAC","groupID":"DEVICE_FAMILY",
- "items":{"WorkRepeatTimes":2}}
+POST /wonder/sweeper360/v1/auth/applyToken
+{"groupID":"DEVICE_FAMILY"}
+→ body.token and body.valid_time
 
-POST /wonder/sweeper360/v1/device/setAction
-{"productKey":"PRODUCT_KEY","deviceName":"DEVICE_MAC",
- "identifier":"StartDefaultClean","input":{"CleanTimes":2}}
+Regional SDK, Authorization: tokens DELEGATED_TOKEN
+GET /v1/iot/device/get_property
+query: product_key=PRODUCT_KEY, device_name=DEVICE_MAC, signed common parameters
+→ code=0, data.result is a property object or a JSON-encoded property object
+
+POST /v1/iot/device/set_property
+form: product_key=PRODUCT_KEY, device_name=DEVICE_MAC,
+      items={"WorkRepeatTimes":2} (items is a JSON string)
+
+POST /v1/iot/device/invoke_service
+form: product_key=PRODUCT_KEY, device_name=DEVICE_MAC,
+      identifier=StartDefaultClean, input={"CleanTimes":2} (JSON string)
 ```
 
-**The SDK-to-proxy property combination is not yet hardware-verified.** A generic
-`items` DTO does not prove that the server forwards every property on every
-region/firmware. Unsupported/missing property reads remain unknown, and a
-setInfo statusCode 100 without matching readback is an error. There is no
-silent fallback to another cloud, model, numeric protocol, or pass count.
+SDK common query parameters include `appkey`, a coordinator-lifetime installation `m2`,
+`sign_ts`, fresh `sign_no`, and `sign = MD5(appkey + m2 + sign_ts + sign_no +
+SDK_SECRET)`. The secret is the SDK's embedded shared signing constant, not a
+user credential. Region `code`, when present, supplies `ci_cy`. No hardcoded EU
+K10 endpoint, room payload, OSS upload or S10 numeric property is used for S1.
+Both SDK forms also carry signed common query parameters.
+
+SwitchBot credentials go only to HTTPS SwitchBot API hosts. Delegated tokens
+go only to the discovered HTTPS Botslab host (or the observed CN vendor host).
+Redirects and arbitrary hosts are rejected. The delegated session is cached in
+memory and refreshed before expiry; changing App session or family invalidates
+its context. A failing action is never automatically replayed.
+
+**The revised SDK flow is statically recovered, not yet hardware-verified.**
+Unsupported/missing property reads remain unknown. Even SDK `code=0` without
+matching readback is an error for cleaning-pass selection. There is no silent
+fallback to another cloud, proxy, model, numeric protocol or pass count.
 
 ## State and failure behavior
 
@@ -72,21 +104,23 @@ silent fallback to another cloud, model, numeric protocol, or pass count.
   A connection failure never causes an automatic repeat write/start.
 - Setting and start operations are serialized per device. Startup polling uses
   the same lock so a poll does not race an in-flight change.
-- Real-time status takes precedence over getInfo for shared telemetry. Missing
+- Real-time status takes precedence over SDK properties for shared telemetry. Missing
   optional properties do not prevent basic status polling.
 - Current pass count is cloud-reported, not restored from a local desired value.
 - S1 has no S10 error-description/problem sensors or summary metrics; the raw
   error code is exposed on the vacuum for future verification.
-- New S1 failures expose bounded codes/types, not cloud bodies, signed URLs or
+- New S1 failures name `getRegion`, `applyToken`, or the failed SDK route with
+  bounded codes/types, not cloud bodies, signed URLs or
   tokens. Redirects are rejected for the private requests.
 
 ## Validation
 
 Tests use actual Home Assistant 2026.10.4 Python APIs with fake HTTP responses.
 No SwitchBot account or device is used. The suite covers discovery/config-flow
-family retention, model-specific routes, payloads, count selection/readback,
-missing counts, validation, active-task rejection, errors, privacy, and existing
-K10/S10 behavior. Run with Python 3.14:
+family retention, model-specific routes, regional authorization, expiry/cache,
+credential separation, form payloads, count selection/readback, missing counts,
+validation, active-task rejection, errors, privacy, and existing K10/S10 behavior.
+These mocks validate client behavior, not actual cloud acceptance. Run with Python 3.14:
 
 ```bash
 python -m pytest -q
@@ -94,7 +128,8 @@ python -m pytest -q
 
 Before calling this hardware-verified:
 
-1. Install the fork, sign in, select the real S1; confirm model, battery and state.
+1. Install v0.5.1 and restart HA. Keep the existing entry; confirm model, battery,
+   state, and a cloud-reported count rather than `unknown`.
 2. Note the original count. While docked, set 2; confirm cloud readback and App UI.
 3. Set 1 and check again. Reload/restart and check the cloud-reported value.
 4. Set 2, explicitly start the custom integration's vacuum; check actual two-pass

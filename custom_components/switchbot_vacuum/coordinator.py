@@ -60,6 +60,7 @@ from .const import (
 )
 from .k10_api import CLEAN_MODES, WONDER, K10Api, K10ProtocolError, room_names
 from .s1_api import S1Api, S1ProtocolError, reported_passes, validate_passes
+from .s1_sdk import S1SdkClient
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -101,6 +102,8 @@ class SwitchBotS10Coordinator(DataUpdateCoordinator):
         self._k10_api: K10Api | None = None
         self._k10_group_id: str | None = None
         self._s1_lock = asyncio.Lock()
+        self._s1_sdk: S1SdkClient | None = None
+        self._s1_group_id: str | None = None
 
         super().__init__(
             hass,
@@ -125,10 +128,25 @@ class SwitchBotS10Coordinator(DataUpdateCoordinator):
         product_key = self.entry.data.get(CONF_PRODUCT_KEY) or S1_PRODUCT_KEYS[
             self.entry.data["device_type"]
         ]
+        group_id = self.entry.data.get(CONF_GROUP_ID) or getattr(self, "_s1_group_id", None)
+        if getattr(self, "_s1_sdk", None) is None:
+            self._s1_sdk = S1SdkClient(
+                async_get_clientsession(self.hass), self._uuid.replace("-", "")
+            )
         return S1Api(
             async_get_clientsession(self.hass), self.wonderlab_endpoint, self._headers(),
-            product_key, self.device_mac, self.entry.data.get(CONF_GROUP_ID),
+            product_key, self.device_mac, group_id, sdk=self._s1_sdk,
         )
+
+    async def _s1_family_id(self) -> str | None:
+        """Recover old entries' family without making basic status depend on discovery."""
+        group_id = self.entry.data.get(CONF_GROUP_ID) or getattr(self, "_s1_group_id", None)
+        if not group_id:
+            devices = await self.async_discover_devices()
+            selected = next((d for d in devices if d["device_mac"] == self.device_mac), {})
+            group_id = selected.get(CONF_GROUP_ID)
+            self._s1_group_id = group_id
+        return group_id
 
     def _s1_invalidate_passes(self) -> None:
         if self.data:
@@ -150,11 +168,8 @@ class SwitchBotS10Coordinator(DataUpdateCoordinator):
         try:
             async with self._s1_lock:
                 api = await self._s1_client()
-                if command in ("passes", "suction") and not api.group_id:
-                    # Older config entries may not have retained the discovered family.
-                    devices = await self.async_discover_devices()
-                    selected = next((d for d in devices if d["device_mac"] == self.device_mac), {})
-                    api.group_id = selected.get(CONF_GROUP_ID)
+                if not api.group_id:
+                    api.group_id = await self._s1_family_id()
                 if command == "passes":
                     properties = await api.set_cleaning_passes(value)
                     self.async_set_updated_data(self.data | {
@@ -182,15 +197,19 @@ class SwitchBotS10Coordinator(DataUpdateCoordinator):
             ) from None
 
     async def _async_update_data_s1(self) -> dict[str, Any]:
-        """Keep basic S1 telemetry even if the proxy omits optional property reads."""
+        """Keep working status telemetry even if SDK authorization or properties fail."""
         try:
             api = await self._s1_client()
             status = await api.get_status()
             properties = {}
             if status.get("online_status") == "online":
                 try:
+                    if not api.group_id:
+                        api.group_id = await self._s1_family_id()
                     properties = await api.get_properties()
-                except (S1ProtocolError, aiohttp.ClientError, TimeoutError, ValueError) as exc:
+                except S1ProtocolError as exc:
+                    _LOGGER.debug("S1 optional properties unavailable: %s", exc)
+                except (aiohttp.ClientError, TimeoutError, ValueError, KeyError, TypeError) as exc:
                     _LOGGER.debug("S1 optional properties unavailable (%s)", type(exc).__name__)
             merged = properties | status
             working_status = merged.get("WorkingStatus")

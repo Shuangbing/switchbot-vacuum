@@ -2,7 +2,7 @@
 
 Custom [HACS](https://hacs.xyz/) integration for SwitchBot robot vacuums, including experimental S1/S1 Plus support.
 
-## S1 / S1 Plus (experimental, v0.5.0)
+## S1 / S1 Plus (experimental, v0.5.1)
 
 S1 (`WoSweeper`) and S1 Plus (`WoSweeperPlus`) are now discovered through the
 existing SwitchBot **account email/password** setup. Public OpenAPI Token/Secret
@@ -18,7 +18,7 @@ vacuum entity in the actions below.
   as active); standby, charging, charged, or dormant states are accepted.
 - `vacuum.start` reads the current count and explicitly sends
   `StartDefaultClean` with `CleanTimes: 1` or `2`. It no longer forces one pass.
-- If the proxy omits the count, the select remains **unknown**, not a fabricated
+- If the SDK omits the count, the select remains **unknown**, not a fabricated
   one pass. Starting is blocked until the count can be read; a failed write or
   unconfirmed readback is reported as an error rather than optimistic success.
 - S1 room cleaning, map download, cleaning-mode switching, S10 summary metrics,
@@ -43,19 +43,30 @@ target:
   entity_id: vacuum.your_s1
 ```
 
-The S1 branch uses the account-discovered regional SwitchBot
-`/wonder/sweeper360/v1/device/getInfo`, `setInfo`, and `setAction` proxies. It does
-not assume that a Japanese S1 uses the EU-only K10 delegated API. This is based
-on static analysis of SwitchBot Android **9.11.15.13**; **S1 hardware, proxy
-acceptance of `WorkRepeatTimes`, and actual two-pass cleaning have not yet been
-tested**. Readback guards make missing/unsupported cloud behavior visible, not
-proof that the robot completed two passes. See [protocol evidence and validation](docs/s1-protocol.md).
+**v0.5.1 fixes the transport used for cleaning passes.** v0.5.0's native proxy
+attempt returned `statusCode 190` on the reported Japanese S1 while state and
+battery reads worked. The error alone does not identify the server's reason.
+Status keeps the working SwitchBot route; properties and actions now follow the
+APK's SDK flow: `getRegion` → family-specific `applyToken` → signed requests to
+the returned regional Botslab host. `WorkRepeatTimes` is written through
+`/v1/iot/device/set_property`, not `setInfo`. The region is discovered, never
+assumed to be EU. Delegated credentials are cached in memory and kept separate
+from the SwitchBot App session.
+
+This is based on static analysis of SwitchBot Android **9.11.15.13** and simulated
+HTTP tests. **The revised SDK flow and actual two-pass cleaning still require
+S1 hardware validation.** Readback confirms a reported setting, not completion
+of two passes. See [protocol evidence and validation](docs/s1-protocol.md).
 
 To use these fork changes, install the local `custom_components/switchbot_vacuum`
 directory or, **after publishing this fork**, use
 `https://github.com/Shuangbing/switchbot-vacuum` as the HACS custom repository.
 Restart Home Assistant, add **SwitchBot Vacuum**, sign in, then select the S1.
-If updating an existing entry, reload it so the new entities appear.
+When updating from v0.5.0, replace the component directory and restart Home
+Assistant; keep the existing config entry and login. The existing select is
+reused. While docked, check that its count loads, set 2, compare with the App,
+and restore the original count. Merely reloading the entry does not replace
+already imported Python code.
 
 Battery is now a linked sensor for all models, compatible with Home Assistant
 2026.8+ (the removed `VacuumEntityFeature.BATTERY` flag is no longer referenced).

@@ -1,8 +1,8 @@
 """S1/S1 Plus named-property protocol recovered from Android 9.11.15.13.
 
 WorkRepeatTimes is a device setting; CleanTimes is a StartDefaultClean input.
-The native SwitchBot proxy is experimental until confirmed on real hardware.
-Never substitute S10 numeric shadow properties or K10 EU cloud credentials.
+Status reads use the working SwitchBot proxy; settings and actions use the
+regional SDK transport. Never substitute S10 numeric properties or a fixed EU host.
 """
 
 from __future__ import annotations
@@ -13,16 +13,13 @@ import uuid
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
+from .s1_sdk import S1ProtocolError, S1SdkClient
+
 if TYPE_CHECKING:
     from aiohttp import ClientSession
 
-PROPERTIES = ["BatteryLevel", "WorkingStatus", "SuctionPowLevel", "WorkRepeatTimes", "ErrorCode"]
 IDLE_STATUSES = frozenset({0, 6, 7, 8})  # standby, charging, charged, dormant
 ACTION_INPUTS = {"PauseRobot", "ReturnChargeBase"}
-
-
-class S1ProtocolError(Exception):
-    """A bounded protocol failure with no cloud response or credential text."""
 
 
 def validate_passes(value: Any) -> int:
@@ -60,6 +57,8 @@ class S1Api:
         product_key: str,
         device_mac: str,
         group_id: str | None,
+        *,
+        sdk: S1SdkClient | None = None,
     ) -> None:
         parsed = urlsplit(endpoint)
         if (
@@ -80,6 +79,9 @@ class S1Api:
         self.product_key = product_key
         self.device_mac = device_mac
         self.group_id = group_id
+        self.sdk = sdk or S1SdkClient(
+            session, headers.get("uuid", uuid.uuid4().hex).replace("-", "")
+        )
 
     async def _post(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
         async with (
@@ -99,7 +101,9 @@ class S1Api:
         if not isinstance(result, dict) or type(result.get("statusCode")) is not int:
             raise S1ProtocolError("S1 API returned an invalid status")
         if result["statusCode"] != 100:
-            raise S1ProtocolError(f"S1 API rejected request (statusCode {result['statusCode']})")
+            raise S1ProtocolError(
+                f"S1 {path.rsplit('/', 1)[-1]} rejected request (statusCode {result['statusCode']})"
+            )
         return result
 
     async def get_status(self) -> dict[str, Any]:
@@ -113,15 +117,8 @@ class S1Api:
         return status
 
     async def get_properties(self) -> dict[str, Any]:
-        result = await self._post(
-            "/wonder/sweeper360/v1/device/getInfo",
-            {"productKey": self.product_key, "deviceName": self.device_mac, "items": PROPERTIES},
-        )
-        body = _object(result.get("body"))
-        for key in ("result", "items"):
-            if key in body:
-                return _object(body[key])
-        return body
+        await self.sdk.authorize(self.endpoint, self.headers, self.group_id)
+        return await self.sdk.get_properties(self.product_key, self.device_mac)
 
     async def set_properties(self, items: dict[str, int]) -> None:
         """Write only the two APK-backed properties implemented by this client."""
@@ -137,15 +134,8 @@ class S1Api:
             raise S1ProtocolError("Unsupported S1 property")
         if not self.group_id:
             raise S1ProtocolError("S1 family identifier is missing; reconfigure the integration")
-        await self._post(
-            "/wonder/sweeper360/v1/device/setInfo",
-            {
-                "productKey": self.product_key,
-                "deviceName": self.device_mac,
-                "groupID": self.group_id,
-                "items": items,
-            },
-        )
+        await self.sdk.authorize(self.endpoint, self.headers, self.group_id)
+        await self.sdk.set_properties(self.product_key, self.device_mac, items)
 
     async def set_cleaning_passes(self, times: int) -> dict[str, Any]:
         validate_passes(times)
@@ -175,26 +165,13 @@ class S1Api:
             raise S1ProtocolError(
                 "S1 cleaning passes are unknown; refresh or set them before starting"
             )
-        await self._post(
-            "/wonder/sweeper360/v1/device/setAction",
-            {
-                "productKey": self.product_key,
-                "deviceName": self.device_mac,
-                "identifier": "StartDefaultClean",
-                "input": {"CleanTimes": times},
-            },
+        await self.sdk.action(
+            self.product_key, self.device_mac, "StartDefaultClean", {"CleanTimes": times}
         )
         return times
 
     async def action(self, identifier: str) -> None:
         if identifier not in ACTION_INPUTS:
             raise S1ProtocolError("Unsupported S1 action")
-        await self._post(
-            "/wonder/sweeper360/v1/device/setAction",
-            {
-                "productKey": self.product_key,
-                "deviceName": self.device_mac,
-                "identifier": identifier,
-                "input": {},
-            },
-        )
+        await self.sdk.authorize(self.endpoint, self.headers, self.group_id)
+        await self.sdk.action(self.product_key, self.device_mac, identifier, {})
