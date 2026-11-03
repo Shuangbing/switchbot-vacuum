@@ -122,6 +122,26 @@ async def test_unknown_passes_does_not_start():
     sdk.action.assert_not_awaited()
 
 
+@pytest.mark.parametrize("times", [1, 2])
+async def test_local_next_start_count_is_sent_explicitly_without_remote_pass_property(times):
+    api, session, sdk, _ = client(properties={"BatteryLevel": 100})
+    assert await api.start(times=times) == times
+    sdk.authorize.assert_awaited_once()
+    sdk.get_properties.assert_not_awaited()
+    sdk.set_properties.assert_not_awaited()
+    sdk.action.assert_awaited_once_with(KEY, MAC, "StartDefaultClean", {"CleanTimes": times})
+    session.post.assert_not_called()
+
+
+@pytest.mark.parametrize("times", [0, 3, True, "2", 1.5])
+async def test_invalid_explicit_start_count_sends_nothing(times):
+    api, _, sdk, _ = client()
+    with pytest.raises(s1.S1ProtocolError):
+        await api.start(times=times)
+    sdk.authorize.assert_not_awaited()
+    sdk.action.assert_not_awaited()
+
+
 async def test_failed_read_preflight_reports_get_property_and_sends_no_write():
     api, _, sdk, _ = client()
     sdk.get_properties.side_effect = s1.S1ProtocolError(

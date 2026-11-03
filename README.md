@@ -2,30 +2,39 @@
 
 Custom [HACS](https://hacs.xyz/) integration for SwitchBot robot vacuums, including experimental S1/S1 Plus support.
 
-## S1 / S1 Plus (experimental, v0.5.2)
+## S1 / S1 Plus (experimental, v0.5.3)
 
-S1 (`WoSweeper`) and S1 Plus (`WoSweeperPlus`) are now discovered through the
-existing SwitchBot **account email/password** setup. Public OpenAPI Token/Secret
-credentials from the built-in SwitchBot Cloud integration are not used here.
-You may keep the built-in integration installed; target this custom integration's
-vacuum entity in the actions below.
+S1 (`WoSweeper`) and S1 Plus (`WoSweeperPlus`) use the existing SwitchBot
+**account email/password** setup. The built-in SwitchBot Cloud integration's
+public Token/Secret credentials are not used. You may keep it installed, but
+start this custom integration's vacuum entity to apply the passes selected here.
 
-- Separate S1 named-property/status branch, rather than S10 numeric shadow IDs.
-- Start, pause/stop, return to base, four suction levels, and a battery sensor.
-- **Cleaning passes / クリーニング回数 / 清扫次数** select with options **1** and **2**.
-- Changing the select writes `WorkRepeatTimes` and checks cloud readback. It never
-  starts cleaning. Finish the current task before changing it (paused tasks count
-  as active); standby, charging, charged, or dormant states are accepted.
-- `vacuum.start` reads the current count and explicitly sends
-  `StartDefaultClean` with `CleanTimes: 1` or `2`. It no longer forces one pass.
-- If the SDK omits the count, the select remains **unknown**, not a fabricated
-  one pass. Starting is blocked until the count can be read; a failed write or
-  unconfirmed readback is reported as an error rather than optimistic success.
-- S1 room cleaning, map download, cleaning-mode switching, S10 summary metrics,
-  and model-specific error descriptions are **not implemented**. A room-cleaning
-  request is rejected, never replaced with a whole-house cleaning request.
+- S1-specific status, start, pause/stop, return to base, four suction levels,
+  and a linked battery sensor; no S10 numeric-shadow protocol.
+- **Cleaning passes / クリーニング回数 / 清扫次数** offers **1** and **2**.
+- **For the tested S1, the count is a persistent HA next-start preference.**
+  Its real SDK response succeeds but omits `WorkRepeatTimes`. The previous
+  versions incorrectly required that property, causing `unknown` and failed
+  selections. v0.5.3 saves the selection in config-entry options and explicitly
+  sends `StartDefaultClean` with `CleanTimes: 1` or `2` on `vacuum.start`.
+  The initial local preference is 1; it is not a claimed device-reported value.
+- The select and vacuum expose `cleaning_passes_source: integration` for this
+  path. It applies only to the next start from **this integration**, not to
+  starts from SwitchBot App or the separate built-in Cloud vacuum. It does not
+  synchronize the App's own count selection.
+- When firmware actually reports valid `WorkRepeatTimes`, that variant retains
+  the device-setting path with a single write and confirmed readback, labelled
+  `cleaning_passes_source: device`.
+- A failed initial SDK read is not treated as proof that the property is absent;
+  the count stays unknown. A present but invalid property also stays unknown.
+  An already-established local preference survives transient SDK read failures.
+- Selecting a count never starts cleaning. Finish any current task first;
+  standby, charging, charged, and dormant states are accepted, not paused tasks.
+- Room cleaning, map download, mode switching, S10 summary metrics, and
+  model-specific error descriptions are not implemented for S1. A room request
+  is rejected rather than converted into a whole-house cleaning command.
 
-Set passes from an automation without starting the robot:
+Set passes without starting the robot:
 
 ```yaml
 action: switchbot_vacuum.set_cleaning_passes
@@ -35,7 +44,7 @@ data:
   times: 2
 ```
 
-Start separately after a confirmed setting:
+Start separately, using the custom integration's vacuum:
 
 ```yaml
 action: vacuum.start
@@ -43,45 +52,26 @@ target:
   entity_id: vacuum.your_s1
 ```
 
-**v0.5.1 fixes the transport used for cleaning passes.** v0.5.0's native proxy
-attempt returned `statusCode 190` on the reported Japanese S1 while state and
-battery reads worked. The error alone does not identify the server's reason.
-Status keeps the working SwitchBot route; properties and actions now follow the
-APK's SDK flow: `getRegion` → family-specific `applyToken` → signed requests to
-the returned regional Botslab host. `WorkRepeatTimes` is written through
-`/v1/iot/device/set_property`, not `setInfo`. The region is discovered, never
-assumed to be EU. Delegated credentials are cached in memory and kept separate
-from the SwitchBot App session.
+Status uses the working SwitchBot route. SDK properties/actions use `getRegion`
+→ family-specific `applyToken` → signed requests to the discovered regional
+Botslab host. No fixed EU cloud is assumed. Delegated credentials stay in memory,
+separate from the App session. Errors expose a bounded, redacted explanation
+and `sdk_property_error`, not full responses or account credentials.
 
-This is based on static analysis of SwitchBot Android **9.11.15.13** and simulated
-HTTP tests. **The revised SDK flow and actual two-pass cleaning still require
-S1 hardware validation.** Readback confirms a reported setting, not completion
-of two passes. See [protocol evidence and validation](docs/s1-protocol.md).
+The APK evidence and SSH investigation are recorded in
+[protocol evidence and validation](docs/s1-protocol.md). Property reads and HA
+selection/persistence were verified on a real S1 with HA 2026.10.4: 1 → 2,
+integration reload retained 2, then restored 1, with the robot remaining docked.
+Actual two-pass traversal is a separate on-device test and was not started.
 
-**v0.5.2 follow-up for SDK `207009` and an always-unknown count:** S1 now uses
-the APK's model-specific SDK key, ignoring any generic native `product_key`
-retained by an existing entry. POST identity fields are sent only in the form,
-not duplicated in the query. A cleaning-pass write first requires a successful
-read of a valid `WorkRepeatTimes`. Read errors appear in the select's
-`sdk_property_error` attribute; SDK errors retain a bounded, redacted server
-explanation. This corrects observed client/APK differences and improves
-diagnosis; **the meaning and root cause of `207009` are not yet established**.
-No new cloud/device success is claimed from the mocked tests.
-
-To use these fork changes, install the local `custom_components/switchbot_vacuum`
-directory or, **after publishing this fork**, use
+Install the `custom_components/switchbot_vacuum` directory or use
 `https://github.com/Shuangbing/switchbot-vacuum` as the HACS custom repository.
-Restart Home Assistant, add **SwitchBot Vacuum**, sign in, then select the S1.
-When updating from v0.5.0/v0.5.1, replace the component directory and restart Home
-Assistant; keep the existing config entry and login. The existing select is
-reused. While docked, check that its count loads, set 2, compare with the App,
-and restore the original count. Merely reloading the entry does not replace
-already imported Python code.
+After replacing Python files, **restart Home Assistant** and keep the existing
+config entry. Reconfiguring credentials or recreating the device is unnecessary.
+For a new installation, add **SwitchBot Vacuum**, sign in, and select the S1.
 
-Battery is now a linked sensor for all models, compatible with Home Assistant
-2026.8+ (the removed `VacuumEntityFeature.BATTERY` flag is no longer referenced).
-The legacy `battery_level` property remains for older consumers, but new
-dashboards/automations should use the battery sensor.
+Battery is a linked sensor for all models, compatible with Home Assistant
+2026.8+; the removed `VacuumEntityFeature.BATTERY` flag is not used.
 
 ## Why this exists
 

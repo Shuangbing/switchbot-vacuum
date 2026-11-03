@@ -27,6 +27,7 @@ from .const import (
     CONF_GROUP_ID,
     CONF_PASSWORD,
     CONF_PRODUCT_KEY,
+    CONF_S1_CLEANING_PASSES,
     CONF_USERNAME,
     DEVICE_TYPE_K10,
     DEVICE_TYPE_K10PRO,
@@ -148,6 +149,11 @@ class SwitchBotS10Coordinator(DataUpdateCoordinator):
             self._s1_group_id = group_id
         return group_id
 
+    def _s1_local_passes(self) -> int:
+        """An explicitly local next-start preference, never device telemetry."""
+        value = self.entry.options.get(CONF_S1_CLEANING_PASSES, 1)
+        return value if type(value) is int and value in (1, 2) else 1
+
     def _s1_invalidate_passes(self) -> None:
         if self.data:
             self.async_set_updated_data(self.data | {
@@ -171,6 +177,15 @@ class SwitchBotS10Coordinator(DataUpdateCoordinator):
                 if not api.group_id:
                     api.group_id = await self._s1_family_id()
                 if command == "passes":
+                    if self.data.get("s1_passes_source") == "integration":
+                        await api.ensure_idle_for_passes()
+                        self.hass.config_entries.async_update_entry(
+                            self.entry, options=self.entry.options | {CONF_S1_CLEANING_PASSES: value}
+                        )
+                        self.async_set_updated_data(self.data | {
+                            "clean_mode": self.data.get("clean_mode", {}) | {"times": value}
+                        })
+                        return
                     properties = await api.set_cleaning_passes(value)
                     self.async_set_updated_data(self.data | {
                         "clean_mode": self.data.get("clean_mode", {}) | {
@@ -181,16 +196,19 @@ class SwitchBotS10Coordinator(DataUpdateCoordinator):
                 if command == "suction":
                     await api.set_properties({"SuctionPowLevel": value})
                 elif command == "start":
-                    await api.start()
+                    if self.data.get("s1_passes_source") == "integration":
+                        await api.start(times=self._s1_local_passes())
+                    else:
+                        await api.start()
                 else:
                     await api.action({"pause": "PauseRobot", "dock": "ReturnChargeBase"}[command])
             await self.async_request_refresh()
         except S1ProtocolError as exc:
-            if command == "passes":
+            if command == "passes" and self.data.get("s1_passes_source") != "integration":
                 self._s1_invalidate_passes()
             raise HomeAssistantError(str(exc)) from None
         except (aiohttp.ClientError, TimeoutError, ValueError, KeyError, TypeError) as exc:
-            if command == "passes":
+            if command == "passes" and self.data.get("s1_passes_source") != "integration":
                 self._s1_invalidate_passes()
             raise HomeAssistantError(
                 f"S1 control failed ({type(exc).__name__}); check the App before retrying"
@@ -203,12 +221,14 @@ class SwitchBotS10Coordinator(DataUpdateCoordinator):
             status = await api.get_status()
             properties = {}
             properties_error = None
+            properties_read = False
             if status.get("online_status") == "online":
                 try:
                     if not api.group_id:
                         api.group_id = await self._s1_family_id()
                     properties = await api.get_properties()
-                    if reported_passes(properties) is None:
+                    properties_read = True
+                    if "WorkRepeatTimes" in properties and reported_passes(properties) is None:
                         properties_error = "S1 get_property did not report valid WorkRepeatTimes"
                 except S1ProtocolError as exc:
                     properties_error = str(exc)
@@ -218,15 +238,28 @@ class SwitchBotS10Coordinator(DataUpdateCoordinator):
                     _LOGGER.debug("S1 optional properties unavailable (%s)", type(exc).__name__)
             merged = properties | status
             working_status = merged.get("WorkingStatus")
+            source = "unknown"
+            times = None
+            if properties_read:
+                if "WorkRepeatTimes" in properties:
+                    source, times = "device", reported_passes(properties)
+                else:
+                    # Real S1 response omits this optional property. Like the APK's
+                    # local-count path, persist the next StartDefaultClean input.
+                    source, times = "integration", self._s1_local_passes()
+            elif self.data and self.data.get("s1_passes_source") == "integration":
+                # Keep an established local preference through transient SDK errors.
+                source, times = "integration", self._s1_local_passes()
             return {
                 "online": status.get("online_status") == "online",
                 "battery": merged.get("BatteryLevel"),
                 "work_status": working_status if type(working_status) is int else None,
                 "error_code": merged.get("ErrorCode"),
                 "s1_properties_error": properties_error,
+                "s1_passes_source": source,
                 "clean_mode": {
                     "fan_level": merged.get("SuctionPowLevel"),
-                    "times": reported_passes(properties),
+                    "times": times,
                 },
                 "clean_summary": {}, "firmware": "", "rooms": {},
             }

@@ -260,6 +260,7 @@ class SwitchBotS10Vacuum(CoordinatorEntity[SwitchBotS10Coordinator], StateVacuum
         attrs["rooms"] = self.coordinator.data.get("rooms", {})
         if self._is_s1:
             attrs["error_code"] = self.coordinator.data.get("error_code")
+            attrs["cleaning_passes_source"] = self.coordinator.data.get("s1_passes_source", "unknown")
         return attrs
 
     def _optimistic_update(self, work_status: int) -> None:

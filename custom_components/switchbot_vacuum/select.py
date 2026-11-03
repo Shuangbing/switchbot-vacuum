@@ -56,7 +56,7 @@ class SwitchBotCleaningMode(CoordinatorEntity[SwitchBotS10Coordinator], SelectEn
 
 
 class SwitchBotCleaningPasses(CoordinatorEntity[SwitchBotS10Coordinator], SelectEntity):
-    """S1 device setting; current_option is always cloud-reported, never restored locally."""
+    """S1 passes: device setting when supported, otherwise persisted next-start input."""
 
     _attr_has_entity_name = True
     _attr_translation_key = "cleaning_passes"
@@ -80,7 +80,15 @@ class SwitchBotCleaningPasses(CoordinatorEntity[SwitchBotS10Coordinator], Select
     @property
     def extra_state_attributes(self) -> dict[str, str | None]:
         """Expose the bounded read failure instead of an unexplained unknown count."""
-        return {"sdk_property_error": self.coordinator.data.get("s1_properties_error")}
+        source = self.coordinator.data.get("s1_passes_source", "unknown")
+        return {
+            "sdk_property_error": self.coordinator.data.get("s1_properties_error"),
+            "cleaning_passes_source": source,
+            "applies_to": (
+                "next_start_from_this_integration" if source == "integration"
+                else "device_setting" if source == "device" else None
+            ),
+        }
 
     async def async_select_option(self, option: str) -> None:
         if option not in self._attr_options:

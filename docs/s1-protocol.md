@@ -89,10 +89,12 @@ Redirects and arbitrary hosts are rejected. The delegated session is cached in
 memory and refreshed before expiry; changing App session or family invalidates
 its context. A failing action is never automatically replayed.
 
-**The revised SDK flow is statically recovered, not yet hardware-verified.**
-Unsupported/missing property reads remain unknown. Even SDK `code=0` without
-matching readback is an error for cleaning-pass selection. There is no silent
-fallback to another cloud, proxy, model, numeric protocol or pass count.
+The SDK routes were recovered statically; the v0.5.3 SSH investigation below
+also verified a successful real S1 property read. Missing `WorkRepeatTimes`
+after a successful read selects the explicitly labelled local next-start path.
+Failed reads and invalid reported counts do not silently become local defaults.
+For firmware reporting the setting, even `code=0` without matching readback
+remains a setting error. No other cloud, proxy or numeric protocol is tried.
 
 ## State and failure behavior
 
@@ -100,15 +102,19 @@ fallback to another cloud, proxy, model, numeric protocol or pass count.
   8 dormant, 9 error, 10 remote control, 11 collecting dust, 31 quick mapping.
 - Times may change only in states 0/6/7/8, with the device online. This also
   rejects paused tasks, consistent with the App's finish-current-task message.
-- A fresh SDK read must report valid `WorkRepeatTimes` before sending the write.
-  If that read fails or omits a valid count, no setting/start command is sent.
+- Remote setting writes require a valid reported `WorkRepeatTimes` first.
+  With the successfully observed absent-property capability, selection instead
+  persists a local next-start preference; it sends no setting request to the robot.
 - Only one write is sent. Up to three readbacks follow (two-second gaps).
   A connection failure never causes an automatic repeat write/start.
 - Setting and start operations are serialized per device. Startup polling uses
   the same lock so a poll does not race an in-flight change.
 - Real-time status takes precedence over SDK properties for shared telemetry. Missing
   optional properties do not prevent basic status polling.
-- Current pass count is cloud-reported, not restored from a local desired value.
+- `cleaning_passes_source: device` means reported telemetry. `integration`
+  means config-entry option `s1_cleaning_passes`, default 1, used as the next
+  `StartDefaultClean.CleanTimes` input. Those semantics are exposed on both
+  entities. The local setting is not synchronized with SwitchBot App.
 - S1 has no S10 error-description/problem sensors or summary metrics; the raw
   error code is exposed on the vacuum for future verification.
 - New S1 failures name `getRegion`, `applyToken`, or the failed SDK route with
@@ -155,6 +161,60 @@ delegate for a subsequent call, without automatically replaying an action.
 resolution of 207009.** After restart, first check the count and this attribute.
 If it remains unknown, collect that bounded error before trying more settings.
 
+## v0.5.3: real S1 SSH investigation
+
+The installed v0.5.2 entry used the correct S1 SDK key and retained a family ID.
+No key migration was needed; the prior wrong-key hypothesis does not explain
+this installation. A read-only authenticated probe executed on the HA host,
+with the existing integration credentials kept there, found:
+
+- Native state: online, WorkingStatus 7, battery 100%.
+- Region discovery selected `ap1-sapp-api.botslab.com`.
+- Delegation succeeded; `get_property` returned `code=0`.
+- `data.result` was a JSON string containing an object with real
+  `WorkingStatus`, `SuctionPowLevel` and `BatteryLevel`, but **no WorkRepeatTimes**.
+- HA's select error was therefore the client's missing-property guard, not a
+  failed GET or broken JSON decoder. The numeric meaning of 207009 is still
+  undocumented; this does not invent a vendor error-code definition.
+
+The earlier interpretation of the generic `SweeperPropertyModel` property path
+as universally available on S1 was too broad. The same APK also contains:
+
+- `SweeperBottomControlModel._getCleanTimes`, async body 0x543ba8: accesses
+  SharedPreferences using `sweeper_cleanTimes_` at 0x543cc8 plus the device ID.
+- `_saveCleanTimesToLocal`, async body 0x54407c: builds the same per-device key
+  at 0x54419c and writes the count preference.
+- `setTotalCleanTimes` 0x3294fc: updates the in-memory count; its special device
+  branch calls `setTotalCleanTimesS10` separately rather than always writing
+  `WorkRepeatTimes`.
+- `SweeperBottomControlModel.startDefaultClean`, async body 0x549e80: reads
+  `getTotalCleanTimes` at 0x549f98 and calls `SweeperUseCase.startDefaultClean`
+  at 0x54a0b8. The service layer constructs `StartDefaultClean.CleanTimes`.
+
+v0.5.3 implements a per-device HA equivalent of this local next-task input when
+successful SDK telemetry omits `WorkRepeatTimes`. It persists the preference in
+config-entry options through HA's API, without editing live `.storage` files.
+A source of `integration` is not device telemetry or App synchronization. The
+reported-setting path remains for firmware that really supplies the property.
+The count is never chosen from the last failed write. Explicit local starts
+validate 1/2 and authorize the SDK before one service call. Offline/active-task
+selection guards and per-device serialization remain in effect.
+
+No cleaning start was used in the SSH investigation. Reading properties and
+changing an HA preference do not establish actual two-pass traversal. Live
+HA deployment/selection checks and the final commit are recorded separately
+from fake HTTP unit tests; no account tokens or raw private response bodies
+belong in this repository.
+
+Live validation on HA 2026.10.4 after deploying v0.5.3: the core configuration
+check passed, core restart completed, and the count showed 1 with source
+`integration` and no property error. Selecting 2 through HA's select service
+succeeded and persisted integer 2 in config-entry options. Reloading the config
+entry retained 2. The test restored 1 and confirmed its persistence. The vacuum
+remained `docked` at all four checks. No `vacuum.start`, SDK start action, or
+physical two-pass traversal test was performed. The 310-test local suite covers
+the explicit `CleanTimes: 2` start payload using fake HTTP/SDK calls.
+
 ## Validation
 
 Tests use actual Home Assistant 2026.10.4 Python APIs with fake HTTP responses.
@@ -168,12 +228,14 @@ These mocks validate client behavior, not actual cloud acceptance. Run with Pyth
 python -m pytest -q
 ```
 
-Before calling this hardware-verified:
+On-device validation checklist:
 
-1. Install v0.5.2 and restart HA. Keep the existing entry; confirm model, battery,
-   state, and a cloud-reported count rather than `unknown`.
-2. Note the original count. While docked, set 2; confirm cloud readback and App UI.
-3. Set 1 and check again. Reload/restart and check the cloud-reported value.
+1. Install v0.5.3 and restart HA. Keep the existing entry; confirm model, battery,
+   state, count and `cleaning_passes_source`.
+2. While docked, select 2. For `integration`, confirm HA option persistence, not
+   App synchronization; for `device`, require matching device readback.
+3. Reload and check that the correct source/count persists. Restore the prior
+   HA preference after a selection-only test.
 4. Set 2, explicitly start the custom integration's vacuum; check actual two-pass
    traversal. Merely seeing the property equal 2 is not completion verification.
 5. Test pause/stop, return to base, suction, offline behavior, and expired login.

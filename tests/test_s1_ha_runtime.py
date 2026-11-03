@@ -12,6 +12,7 @@ from homeassistant.helpers.update_coordinator import UpdateFailed
 from custom_components.switchbot_vacuum import binary_sensor, config_flow, select, sensor, vacuum
 from custom_components.switchbot_vacuum import coordinator as module
 from custom_components.switchbot_vacuum.const import (
+    CONF_S1_CLEANING_PASSES,
     DEVICE_TYPE_K10,
     DEVICE_TYPE_S1,
     DEVICE_TYPE_S1_PLUS,
@@ -39,7 +40,7 @@ def coordinator(device_type=DEVICE_TYPE_S1):
 def actual_coordinator():
     coord = object.__new__(module.SwitchBotS10Coordinator)
     coord.entry = SimpleNamespace(
-        data={"device_type": DEVICE_TYPE_S1, "group_id": "family"}, title="My S1"
+        data={"device_type": DEVICE_TYPE_S1, "group_id": "family"}, title="My S1", options={}
     )
     coord.hass = MagicMock()
     coord.device_mac = "AABBCCDDEEFF"
@@ -310,17 +311,119 @@ def test_select_explains_unknown_using_bounded_read_error():
     assert attrs["sdk_property_error"] == coord.data["s1_properties_error"]
 
 
-async def test_optional_read_distinguishes_missing_property_and_clears_error_on_success():
+async def test_successful_read_without_property_uses_explicit_local_source():
     coord = actual_coordinator()
     api = MagicMock()
     api.get_status = AsyncMock(return_value={"online_status": "online", "WorkingStatus": 7})
     api.get_properties = AsyncMock(side_effect=[{}, {"WorkRepeatTimes": 2}])
     coord._s1_client = AsyncMock(return_value=api)
     first = await coord._async_update_data_s1()
-    assert "did not report valid WorkRepeatTimes" in first["s1_properties_error"]
+    assert first["s1_properties_error"] is None
+    assert first["s1_passes_source"] == "integration"
+    assert first["clean_mode"]["times"] == 1
     second = await coord._async_update_data_s1()
     assert second["s1_properties_error"] is None
     assert second["clean_mode"]["times"] == 2
+    assert second["s1_passes_source"] == "device"
+
+
+async def test_actual_s1_shape_uses_persisted_preference_after_coordinator_recreation():
+    coord = actual_coordinator()
+    coord.entry.options = {CONF_S1_CLEANING_PASSES: 2}
+    api = MagicMock()
+    api.get_status = AsyncMock(return_value={
+        "online_status": "online", "WorkingStatus": 7, "BatteryLevel": 100,
+    })
+    api.get_properties = AsyncMock(return_value={
+        "BatteryLevel": 100, "WorkingStatus": 7, "SuctionPowLevel": 2,
+    })
+    coord._s1_client = AsyncMock(return_value=api)
+    data = await coord._async_update_data_s1()
+    assert data["clean_mode"]["times"] == 2
+    assert data["s1_passes_source"] == "integration"
+    assert data["s1_properties_error"] is None
+
+
+async def test_local_pass_selection_persists_options_without_writing_robot():
+    coord = actual_coordinator()
+    coord.data["s1_passes_source"] = "integration"
+    coord.data["clean_mode"]["times"] = 1
+    coord.entry.options = {"unrelated_option": "preserved"}
+    coord.hass.config_entries.async_update_entry.side_effect = (
+        lambda entry, *, options: setattr(entry, "options", options)
+    )
+    api = MagicMock()
+    api.ensure_idle_for_passes = AsyncMock()
+    coord._s1_client = AsyncMock(return_value=api)
+    await coord.async_s1_control("passes", 2)
+    api.ensure_idle_for_passes.assert_awaited_once()
+    assert coord.entry.options == {"unrelated_option": "preserved", CONF_S1_CLEANING_PASSES: 2}
+    assert coord.data["clean_mode"]["times"] == 2
+    api.set_cleaning_passes.assert_not_called()
+    api.set_properties.assert_not_called()
+    api.start.assert_not_called()
+    coord.async_request_refresh.assert_not_awaited()
+
+
+async def test_active_task_rejects_local_change_without_losing_previous_preference():
+    coord = actual_coordinator()
+    coord.data["s1_passes_source"] = "integration"
+    coord.entry.options = {CONF_S1_CLEANING_PASSES: 2}
+    api = MagicMock()
+    api.ensure_idle_for_passes = AsyncMock(side_effect=S1ProtocolError("Finish the current task"))
+    coord._s1_client = AsyncMock(return_value=api)
+    with pytest.raises(HomeAssistantError, match="Finish the current task"):
+        await coord.async_s1_control("passes", 1)
+    assert coord.entry.options[CONF_S1_CLEANING_PASSES] == 2
+    assert coord.data["clean_mode"]["times"] == 2
+    coord.hass.config_entries.async_update_entry.assert_not_called()
+
+
+async def test_local_start_uses_stored_count_not_an_unconfirmed_display_value():
+    coord = actual_coordinator()
+    coord.data["s1_passes_source"] = "integration"
+    coord.data["clean_mode"]["times"] = 1
+    coord.entry.options = {CONF_S1_CLEANING_PASSES: 2}
+    api = MagicMock()
+    api.start = AsyncMock()
+    coord._s1_client = AsyncMock(return_value=api)
+    await coord.async_s1_control("start")
+    api.start.assert_awaited_once_with(times=2)
+
+
+@pytest.mark.parametrize("value", [None, 0, 3, True, "2", {"value": 2}])
+async def test_present_but_invalid_device_pass_property_is_not_silently_local(value):
+    coord = actual_coordinator()
+    api = MagicMock()
+    api.get_status = AsyncMock(return_value={"online_status": "online", "WorkingStatus": 7})
+    api.get_properties = AsyncMock(return_value={"WorkRepeatTimes": value})
+    coord._s1_client = AsyncMock(return_value=api)
+    data = await coord._async_update_data_s1()
+    assert data["s1_passes_source"] == "device"
+    assert data["clean_mode"]["times"] is None
+    assert data["s1_properties_error"] is not None
+
+
+async def test_transient_sdk_error_keeps_established_local_preference_and_exposes_error():
+    coord = actual_coordinator()
+    coord.data["s1_passes_source"] = "integration"
+    coord.entry.options = {CONF_S1_CLEANING_PASSES: 2}
+    api = MagicMock()
+    api.get_status = AsyncMock(return_value={"online_status": "online", "WorkingStatus": 7})
+    api.get_properties = AsyncMock(side_effect=S1ProtocolError("S1 SDK session rejected"))
+    coord._s1_client = AsyncMock(return_value=api)
+    data = await coord._async_update_data_s1()
+    assert data["clean_mode"]["times"] == 2
+    assert data["s1_passes_source"] == "integration"
+    assert data["s1_properties_error"] == "S1 SDK session rejected"
+
+
+def test_local_select_attributes_do_not_claim_device_or_app_synchronization():
+    coord = coordinator()
+    coord.data["s1_passes_source"] = "integration"
+    attrs = select.SwitchBotCleaningPasses(coord).extra_state_attributes
+    assert attrs["cleaning_passes_source"] == "integration"
+    assert attrs["applies_to"] == "next_start_from_this_integration"
 
 
 async def test_new_s1_clients_share_the_in_memory_sdk_session():

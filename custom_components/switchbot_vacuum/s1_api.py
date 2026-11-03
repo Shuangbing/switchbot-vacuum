@@ -1,6 +1,7 @@
 """S1/S1 Plus named-property protocol recovered from Android 9.11.15.13.
 
-WorkRepeatTimes is a device setting; CleanTimes is a StartDefaultClean input.
+WorkRepeatTimes is an optional device setting; CleanTimes is a StartDefaultClean input.
+For firmware without that setting, the coordinator persists the input preference.
 Status reads use the working SwitchBot proxy; settings and actions use the
 regional SDK transport. Never substitute S10 numeric properties or a fixed EU host.
 """
@@ -137,14 +138,18 @@ class S1Api:
         await self.sdk.authorize(self.endpoint, self.headers, self.group_id)
         await self.sdk.set_properties(self.product_key, self.device_mac, items)
 
-    async def set_cleaning_passes(self, times: int) -> dict[str, Any]:
-        validate_passes(times)
+    async def ensure_idle_for_passes(self) -> None:
+        """Changing the next-task preference never interrupts an active task."""
         status = await self.get_status()
         if status.get("online_status") != "online":
             raise S1ProtocolError("S1 is offline")
         working = status.get("WorkingStatus")
         if type(working) is not int or working not in IDLE_STATUSES:
             raise S1ProtocolError("Finish the current task before changing cleaning passes")
+
+    async def set_cleaning_passes(self, times: int) -> dict[str, Any]:
+        validate_passes(times)
+        await self.ensure_idle_for_passes()
         # Prove that the selected SDK device is readable before sending a write.
         # v0.5.1 hid read failures behind `unknown` then attempted set_property.
         before = await self.get_properties()
@@ -164,10 +169,14 @@ class S1Api:
             "S1 accepted the write but cleaning passes were not confirmed; check the App"
         )
 
-    async def start(self) -> int:
-        """Honor freshly reported passes, never silently force CleanTimes=1."""
-        properties = await self.get_properties()
-        times = reported_passes(properties)
+    async def start(self, *, times: int | None = None) -> int:
+        """Send either a deliberate local preference or fresh device telemetry."""
+        if times is not None:
+            validate_passes(times)
+            await self.sdk.authorize(self.endpoint, self.headers, self.group_id)
+        else:
+            properties = await self.get_properties()
+            times = reported_passes(properties)
         if times is None:
             raise S1ProtocolError(
                 "S1 cleaning passes are unknown; refresh or set them before starting"
