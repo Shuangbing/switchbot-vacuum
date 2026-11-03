@@ -11,6 +11,7 @@ from custom_components.switchbot_vacuum.s1_sdk import (
     S1ProtocolError,
     S1SdkClient,
     regional_endpoint,
+    sdk_message,
 )
 
 WONDER = "https://wonderlabs.jp.api.switchbot.net"
@@ -85,6 +86,8 @@ async def test_sdk_set_is_form_encoded_with_json_string_and_fresh_signatures():
         "device_name": MAC,
         "items": '{"WorkRepeatTimes":2}',
     }
+    assert "product_key" not in first.kwargs["params"]
+    assert "device_name" not in first.kwargs["params"]
     assert "json" not in first.kwargs
     assert first.kwargs["params"]["sign_no"] != second.kwargs["params"]["sign_no"]
     assert all(k in first.kwargs["params"] for k in ("appkey", "m2", "sign_ts", "sign"))
@@ -270,11 +273,122 @@ async def test_190_regression_status_works_settings_bypass_failing_native_proxy(
         }
     )
     sdk, session = client(
-        status, region(), delegated(), response({"code": 0}), properties('{"WorkRepeatTimes":2}')
+        status,
+        region(),
+        delegated(),
+        properties('{"WorkRepeatTimes":1}'),
+        response({"code": 0}),
+        properties('{"WorkRepeatTimes":2}'),
     )
     api = S1Api(session, WONDER, HEADERS, KEY, MAC, "family", sdk=sdk)
     assert await api.set_cleaning_passes(2) == {"WorkRepeatTimes": 2}
     urls = [c.args[1] for c in session.request.call_args_list]
     assert any(url.endswith("/set_property") for url in urls)
     assert all(not url.endswith(("/getInfo", "/setInfo", "/setAction")) for url in urls)
-    assert len(urls) == 5
+    assert len(urls) == 6
+
+
+async def test_207009_does_not_establish_a_meaning_but_retains_redacted_server_explanation():
+    sdk, _ = client(
+        region(),
+        delegated(),
+        response(
+            {
+                "code": 207009,
+                "msg": "No device access: AABBCCDDEEFF fake-delegated-token",
+                "data": "SECRET",
+            }
+        ),
+    )
+    await sdk.authorize(WONDER, HEADERS, "family")
+    with pytest.raises(S1ProtocolError) as error:
+        await sdk.get_properties(KEY, MAC)
+    message = str(error.value)
+    assert "get_property" in message and "207009" in message
+    assert "No device access" in message
+    assert MAC not in message and "fake-delegated-token" not in message
+    assert "SECRET" not in message
+
+
+async def test_sdk_login_code_invalidates_session_without_replaying_request():
+    sdk, session = client(
+        region(), delegated(), response({"code": 100003, "msg": "Login verification failed"})
+    )
+    await sdk.authorize(WONDER, HEADERS, "family")
+    with pytest.raises(S1ProtocolError, match="100003"):
+        await sdk.set_properties(KEY, MAC, {"WorkRepeatTimes": 2})
+    assert sdk.token is None and sdk.token_expiry == 0
+    assert session.request.call_count == 3
+
+
+@pytest.mark.parametrize("value", [None, {}, [], 42, True])
+def test_message_does_not_stringify_arbitrary_response_data(value):
+    assert sdk_message(value, ()) is None
+
+
+def test_message_redacts_sessions_identifiers_addresses_and_urls():
+    value = (
+        "Device denied fake-app-token fake-delegated-token selected-family "
+        "AABBCCDDEEFF user@example.com https://example.com/path?token=abc "
+        "sid=short-id sign=abcd1234 SECRET " + "abcdef0123456789" * 20
+    )
+    message = sdk_message(value, ("fake-app-token", "fake-delegated-token", "selected-family"))
+    assert len(message) <= 160
+    assert message.startswith("Device denied")
+    for secret in (
+        "fake-app-token",
+        "fake-delegated-token",
+        "selected-family",
+        "AABBCCDDEEFF",
+        "user@example.com",
+        "https://",
+        "short-id",
+        "abcd1234",
+        "SECRET",
+        "abcdef0123",
+    ):
+        assert secret not in message
+
+
+def test_long_secret_is_redacted_before_output_is_truncated():
+    secret = "sensitive-" * 40
+    assert sdk_message(secret, (secret,)) == "[redacted]"
+
+
+def test_message_preserves_generic_parameter_explanations_not_credential_assignments():
+    assert sdk_message("device_name is invalid", ()) == "device_name is invalid"
+
+
+async def test_207009_get_preflight_is_read_only_and_preserves_actual_error_stage():
+    status = response(
+        {
+            "statusCode": 100,
+            "body": {
+                "items": [
+                    {
+                        "device_mac": MAC,
+                        "online_status": "online",
+                        "WorkingStatus": 7,
+                    }
+                ]
+            },
+        }
+    )
+    sdk, session = client(
+        status,
+        region(),
+        delegated(),
+        response(
+            {
+                "code": 207009,
+                "msg": "Example server explanation",  # simulated, not a code definition
+            }
+        ),
+    )
+    api = S1Api(session, WONDER, HEADERS, KEY, MAC, "family", sdk=sdk)
+    with pytest.raises(S1ProtocolError, match="get_property.*207009.*Example server explanation"):
+        await api.set_cleaning_passes(2)
+    calls = session.request.call_args_list
+    assert len(calls) == 4
+    assert calls[-1].args == ("GET", SDK_HOST + "/v1/iot/device/get_property")
+    assert all(not c.args[1].endswith(("/set_property", "/invoke_service")) for c in calls)

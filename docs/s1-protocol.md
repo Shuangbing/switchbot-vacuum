@@ -100,6 +100,8 @@ fallback to another cloud, proxy, model, numeric protocol or pass count.
   8 dormant, 9 error, 10 remote control, 11 collecting dust, 31 quick mapping.
 - Times may change only in states 0/6/7/8, with the device online. This also
   rejects paused tasks, consistent with the App's finish-current-task message.
+- A fresh SDK read must report valid `WorkRepeatTimes` before sending the write.
+  If that read fails or omits a valid count, no setting/start command is sent.
 - Only one write is sent. Up to three readbacks follow (two-second gaps).
   A connection failure never causes an automatic repeat write/start.
 - Setting and start operations are serialized per device. Startup polling uses
@@ -110,8 +112,48 @@ fallback to another cloud, proxy, model, numeric protocol or pass count.
 - S1 has no S10 error-description/problem sensors or summary metrics; the raw
   error code is exposed on the vacuum for future verification.
 - New S1 failures name `getRegion`, `applyToken`, or the failed SDK route with
-  bounded codes/types, not cloud bodies, signed URLs or
-  tokens. Redirects are rejected for the private requests.
+  bounded codes/types. Since v0.5.2, an SDK error can include a message string
+  (at most 160 characters), with known sessions, identifiers, addresses, URLs and
+  opaque strings redacted. Arbitrary response bodies/objects are never echoed.
+  Redirects are rejected for the private requests.
+
+## v0.5.2: `207009` investigation and evidence limits
+
+The user reported v0.5.1 `set_property` code **207009** and confirmed that its
+current count had always been **unknown**, including before attempting a write.
+This establishes neither the GET response code nor the meaning of 207009. No
+matching vendor error definition was found in the retained APK evidence.
+
+Two client/APK discrepancies were identified and corrected:
+
+1. The App calls `DeviceUtil.getProductKey(deviceType)` →
+   `Sweeper360Util.getProductKey`, selecting S1/S1 Plus SDK keys by type.
+   v0.5.1 instead preferred the native discovery/config entry's `product_key`
+   when nonempty. v0.5.2 always uses the observed model mapping for S1.
+   The actual value in the user's installed entry has not been inspected, so
+   this is not proof that their key was wrong.
+2. `TslHttp.setProperty` assembles identity and `items` in the form; common
+   signing parameters are added separately. v0.5.1 duplicated identity into
+   POST query parameters. v0.5.2 puts identity only in the form for POST and
+   keeps it in the query for GET. Server tolerance of duplication is unknown.
+
+Additional non-account evidence: two read-only requests to the observed JP SDK
+`get_property` route, with dummy device identity and either no Authorization or
+an intentionally invalid token, both returned HTTP 200, code **100003**, message
+`Login verification failed` on 2026-11-03 UTC. These requests neither used the
+user's credentials nor accessed the user's device. They establish only that
+this login-failure case differs from 207009, not that 207009 guarantees valid
+authorization or has a particular device/property meaning. No write probe ran.
+
+The select now exposes the bounded read error as `sdk_property_error`, including
+the distinction between SDK rejection, transport failure and a successful
+response without valid `WorkRepeatTimes`. SDK error messages are redacted before
+truncation and display. A login-verification code 100003 invalidates the in-memory
+delegate for a subsequent call, without automatically replaying an action.
+
+**v0.5.2 is a candidate correction plus diagnostic improvement, not a verified
+resolution of 207009.** After restart, first check the count and this attribute.
+If it remains unknown, collect that bounded error before trying more settings.
 
 ## Validation
 
@@ -128,7 +170,7 @@ python -m pytest -q
 
 Before calling this hardware-verified:
 
-1. Install v0.5.1 and restart HA. Keep the existing entry; confirm model, battery,
+1. Install v0.5.2 and restart HA. Keep the existing entry; confirm model, battery,
    state, and a cloud-reported count rather than `unknown`.
 2. Note the original count. While docked, set 2; confirm cloud readback and App UI.
 3. Set 1 and check again. Reload/restart and check the cloud-reported value.

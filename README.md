@@ -2,7 +2,7 @@
 
 Custom [HACS](https://hacs.xyz/) integration for SwitchBot robot vacuums, including experimental S1/S1 Plus support.
 
-## S1 / S1 Plus (experimental, v0.5.1)
+## S1 / S1 Plus (experimental, v0.5.2)
 
 S1 (`WoSweeper`) and S1 Plus (`WoSweeperPlus`) are now discovered through the
 existing SwitchBot **account email/password** setup. Public OpenAPI Token/Secret
@@ -58,11 +58,21 @@ HTTP tests. **The revised SDK flow and actual two-pass cleaning still require
 S1 hardware validation.** Readback confirms a reported setting, not completion
 of two passes. See [protocol evidence and validation](docs/s1-protocol.md).
 
+**v0.5.2 follow-up for SDK `207009` and an always-unknown count:** S1 now uses
+the APK's model-specific SDK key, ignoring any generic native `product_key`
+retained by an existing entry. POST identity fields are sent only in the form,
+not duplicated in the query. A cleaning-pass write first requires a successful
+read of a valid `WorkRepeatTimes`. Read errors appear in the select's
+`sdk_property_error` attribute; SDK errors retain a bounded, redacted server
+explanation. This corrects observed client/APK differences and improves
+diagnosis; **the meaning and root cause of `207009` are not yet established**.
+No new cloud/device success is claimed from the mocked tests.
+
 To use these fork changes, install the local `custom_components/switchbot_vacuum`
 directory or, **after publishing this fork**, use
 `https://github.com/Shuangbing/switchbot-vacuum` as the HACS custom repository.
 Restart Home Assistant, add **SwitchBot Vacuum**, sign in, then select the S1.
-When updating from v0.5.0, replace the component directory and restart Home
+When updating from v0.5.0/v0.5.1, replace the component directory and restart Home
 Assistant; keep the existing config entry and login. The existing select is
 reused. While docked, check that its count loads, set 2, compare with the App,
 and restore the original count. Merely reloading the entry does not replace

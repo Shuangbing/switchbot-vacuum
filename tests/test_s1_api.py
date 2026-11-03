@@ -27,7 +27,9 @@ def client(*, working=7, online="online", properties=None):
     session.post.return_value = context
     sdk = MagicMock()
     sdk.authorize = AsyncMock()
-    sdk.get_properties = AsyncMock(return_value=properties or {})
+    sdk.get_properties = AsyncMock(
+        return_value={"WorkRepeatTimes": 1} if properties is None else properties
+    )
     sdk.set_properties = AsyncMock()
     sdk.action = AsyncMock()
     api = s1.S1Api(
@@ -72,7 +74,12 @@ async def test_offline_never_writes():
 
 async def test_stale_readback_polls_without_repeating_write():
     api, _, sdk, _ = client()
-    sdk.get_properties.side_effect = [{"WorkRepeatTimes": 1}, {}, {"WorkRepeatTimes": 2}]
+    sdk.get_properties.side_effect = [
+        {"WorkRepeatTimes": 1},  # required read preflight
+        {"WorkRepeatTimes": 1},
+        {},
+        {"WorkRepeatTimes": 2},
+    ]
     with patch.object(s1.asyncio, "sleep", new_callable=AsyncMock) as sleep:
         assert (await api.set_cleaning_passes(2))["WorkRepeatTimes"] == 2
     assert sleep.await_count == 2
@@ -81,13 +88,14 @@ async def test_stale_readback_polls_without_repeating_write():
 
 async def test_accepted_write_without_readback_is_not_success():
     api, _, sdk, _ = client()
+    sdk.get_properties.side_effect = [{"WorkRepeatTimes": 1}, {}, {}, {}]
     with (
         patch.object(s1.asyncio, "sleep", new_callable=AsyncMock),
         pytest.raises(s1.S1ProtocolError, match="not confirmed"),
     ):
         await api.set_cleaning_passes(2)
     assert sdk.set_properties.await_count == 1
-    assert sdk.get_properties.await_count == 3
+    assert sdk.get_properties.await_count == 4
 
 
 async def test_network_failure_does_not_repeat_write():
@@ -96,7 +104,7 @@ async def test_network_failure_does_not_repeat_write():
     with pytest.raises(TimeoutError):
         await api.set_cleaning_passes(2)
     assert sdk.set_properties.await_count == 1
-    sdk.get_properties.assert_not_awaited()
+    sdk.get_properties.assert_awaited_once()
 
 
 @pytest.mark.parametrize("times", [1, 2])
@@ -108,10 +116,29 @@ async def test_start_sends_reported_count_not_fixed_one(times):
 
 
 async def test_unknown_passes_does_not_start():
-    api, _, sdk, _ = client()
+    api, _, sdk, _ = client(properties={})
     with pytest.raises(s1.S1ProtocolError, match="unknown"):
         await api.start()
     sdk.action.assert_not_awaited()
+
+
+async def test_failed_read_preflight_reports_get_property_and_sends_no_write():
+    api, _, sdk, _ = client()
+    sdk.get_properties.side_effect = s1.S1ProtocolError(
+        "S1 SDK get_property rejected request (code 207009)"
+    )
+    with pytest.raises(s1.S1ProtocolError, match="get_property.*207009"):
+        await api.set_cleaning_passes(2)
+    sdk.set_properties.assert_not_awaited()
+    sdk.action.assert_not_awaited()
+
+
+@pytest.mark.parametrize("value", [None, 0, True, "2", {"value": 2}])
+async def test_missing_valid_count_preflight_sends_no_write(value):
+    api, _, sdk, _ = client(properties={"WorkRepeatTimes": value})
+    with pytest.raises(s1.S1ProtocolError, match="no setting was sent"):
+        await api.set_cleaning_passes(2)
+    sdk.set_properties.assert_not_awaited()
 
 
 @pytest.mark.parametrize("identifier", ["PauseRobot", "ReturnChargeBase"])

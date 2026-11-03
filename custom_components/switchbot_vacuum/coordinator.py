@@ -125,9 +125,9 @@ class SwitchBotS10Coordinator(DataUpdateCoordinator):
         await self._ensure_token()
         if not self._is_s1() or not self.device_mac or not self.wonderlab_endpoint:
             raise S1ProtocolError("Select an S1 device before using S1 controls")
-        product_key = self.entry.data.get(CONF_PRODUCT_KEY) or S1_PRODUCT_KEYS[
-            self.entry.data["device_type"]
-        ]
+        # The S1 App selects the SDK key by model, not the generic getdevice field.
+        # Existing entries can retain a non-SDK product_key from native discovery.
+        product_key = S1_PRODUCT_KEYS[self.entry.data["device_type"]]
         group_id = self.entry.data.get(CONF_GROUP_ID) or getattr(self, "_s1_group_id", None)
         if getattr(self, "_s1_sdk", None) is None:
             self._s1_sdk = S1SdkClient(
@@ -202,14 +202,19 @@ class SwitchBotS10Coordinator(DataUpdateCoordinator):
             api = await self._s1_client()
             status = await api.get_status()
             properties = {}
+            properties_error = None
             if status.get("online_status") == "online":
                 try:
                     if not api.group_id:
                         api.group_id = await self._s1_family_id()
                     properties = await api.get_properties()
+                    if reported_passes(properties) is None:
+                        properties_error = "S1 get_property did not report valid WorkRepeatTimes"
                 except S1ProtocolError as exc:
+                    properties_error = str(exc)
                     _LOGGER.debug("S1 optional properties unavailable: %s", exc)
                 except (aiohttp.ClientError, TimeoutError, ValueError, KeyError, TypeError) as exc:
+                    properties_error = f"S1 property read failed ({type(exc).__name__})"
                     _LOGGER.debug("S1 optional properties unavailable (%s)", type(exc).__name__)
             merged = properties | status
             working_status = merged.get("WorkingStatus")
@@ -218,6 +223,7 @@ class SwitchBotS10Coordinator(DataUpdateCoordinator):
                 "battery": merged.get("BatteryLevel"),
                 "work_status": working_status if type(working_status) is int else None,
                 "error_code": merged.get("ErrorCode"),
+                "s1_properties_error": properties_error,
                 "clean_mode": {
                     "fan_level": merged.get("SuctionPowLevel"),
                     "times": reported_passes(properties),

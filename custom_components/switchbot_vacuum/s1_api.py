@@ -145,6 +145,13 @@ class S1Api:
         working = status.get("WorkingStatus")
         if type(working) is not int or working not in IDLE_STATUSES:
             raise S1ProtocolError("Finish the current task before changing cleaning passes")
+        # Prove that the selected SDK device is readable before sending a write.
+        # v0.5.1 hid read failures behind `unknown` then attempted set_property.
+        before = await self.get_properties()
+        if reported_passes(before) is None:
+            raise S1ProtocolError(
+                "S1 get_property did not report valid WorkRepeatTimes; no setting was sent"
+            )
         await self.set_properties({"WorkRepeatTimes": times})
         # Repeat only reads. A timed-out write may already have reached the robot.
         for attempt in range(3):

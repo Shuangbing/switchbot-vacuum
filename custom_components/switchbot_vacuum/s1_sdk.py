@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import re
 import time
 import uuid
 from typing import TYPE_CHECKING, Any
@@ -23,6 +24,33 @@ if TYPE_CHECKING:
 
 class S1ProtocolError(Exception):
     """A bounded error without response bodies, signed URLs or credential text."""
+
+
+def sdk_message(value: Any, secrets: tuple[str, ...]) -> str | None:
+    """Retain a short server explanation, redacting credentials and identifiers.
+
+    Only the message string is considered: never stringify arbitrary cloud JSON.
+    This is diagnostic evidence, not a mapping of an undocumented numeric code.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    # Redact before truncating so a long credential is not exposed as a prefix.
+    for secret in sorted((s for s in secrets if s), key=len, reverse=True):
+        value = value.replace(secret, "[redacted]")
+    value = re.sub(r"https?://\S+", "[url]", value, flags=re.IGNORECASE)
+    value = re.sub(r"[\w.+-]+@[\w.-]+", "[email]", value)
+    value = re.sub(r"\b(?:tokens|bearer)\s+\S+", "[credential]", value, flags=re.IGNORECASE)
+    value = re.sub(
+        r"\b(?:authorization|tokens?|bearer|secret|password|sid|qid|groupid|device_name|"
+        r"device_mac|m2|sign)\b\s*[:=]\s*[^\s,;]+",
+        "[credential]",
+        value,
+        flags=re.IGNORECASE,
+    )
+    value = re.sub(r"\b[A-Za-z0-9_./+=-]{20,}\b|\b[0-9A-Fa-f]{12,}\b", "[id]", value)
+    value = re.sub(r"\b[A-Z0-9_]{6,}\b|\b\d{6,}\b", "[id]", value)
+    value = " ".join("".join(c for c in value if c.isprintable()).split())
+    return value[:160] or None
 
 
 def regional_endpoint(host: Any) -> str:
@@ -168,7 +196,10 @@ class S1SdkClient:
         if not self.endpoint or not self.token:
             raise S1ProtocolError("S1 SDK session is not initialized")
         params = signed_params(self.installation_id)
-        params.update(appver="9.11.15.13", product_key=product_key, device_name=device_mac)
+        params["appver"] = "9.11.15.13"
+        # Retrofit/Dio puts identity in GET queries, but only in the form for POST.
+        if form is None:
+            params.update(product_key=product_key, device_name=device_mac)
         if self.region_code:
             params["ci_cy"] = self.region_code
         async with (
@@ -191,10 +222,19 @@ class S1SdkClient:
                 )
             result = await response.json()
         if not isinstance(result, dict) or type(result.get("code")) is not int:
-            raise S1ProtocolError("S1 SDK returned an invalid status")
+            raise S1ProtocolError(f"S1 SDK {path.rsplit('/', 1)[-1]} returned an invalid status")
         if result["code"] != 0:
+            secrets = (self.token or "", self.installation_id, device_mac)
+            if self._context:
+                secrets += (self._context[1], self._context[2])
+            message = sdk_message(result.get("msg") or result.get("message"), secrets)
+            if result["code"] == 100003:
+                # Observed from the regional SDK's login-verification response.
+                # Refresh on a later call, never replay this write/action.
+                self.token, self.token_expiry = None, 0
             raise S1ProtocolError(
                 f"S1 SDK {path.rsplit('/', 1)[-1]} rejected request (code {result['code']})"
+                + (f": {message}" if message else "")
             )
         return result
 

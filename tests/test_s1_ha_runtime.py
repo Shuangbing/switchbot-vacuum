@@ -204,6 +204,7 @@ async def test_missing_optional_count_keeps_vacuum_telemetry():
     assert data["battery"] == 85
     assert data["work_status"] == 7
     assert data["clean_mode"]["times"] is None
+    assert data["s1_properties_error"] == "No properties"
     assert data["rooms"] == {}
 
 
@@ -289,6 +290,37 @@ async def test_regional_client_uses_ha_session_and_apk_product_key():
     assert api.product_key == "189c56a889be"
     assert api.group_id == "family"
     coord._ensure_token.assert_awaited_once()
+
+
+@pytest.mark.parametrize("kind,key", [
+    (DEVICE_TYPE_S1, "189c56a889be"), (DEVICE_TYPE_S1_PLUS, "0f698f178cba"),
+])
+async def test_s1_sdk_uses_model_key_instead_of_native_product_key(kind, key):
+    coord = actual_coordinator()
+    coord.entry.data.update(device_type=kind, product_key="native-non-sdk-key")
+    with patch.object(module, "async_get_clientsession", return_value=MagicMock()):
+        api = await coord._s1_client()
+    assert api.product_key == key
+
+
+def test_select_explains_unknown_using_bounded_read_error():
+    coord = coordinator()
+    coord.data["s1_properties_error"] = "S1 SDK get_property rejected request (code 207009)"
+    attrs = select.SwitchBotCleaningPasses(coord).extra_state_attributes
+    assert attrs["sdk_property_error"] == coord.data["s1_properties_error"]
+
+
+async def test_optional_read_distinguishes_missing_property_and_clears_error_on_success():
+    coord = actual_coordinator()
+    api = MagicMock()
+    api.get_status = AsyncMock(return_value={"online_status": "online", "WorkingStatus": 7})
+    api.get_properties = AsyncMock(side_effect=[{}, {"WorkRepeatTimes": 2}])
+    coord._s1_client = AsyncMock(return_value=api)
+    first = await coord._async_update_data_s1()
+    assert "did not report valid WorkRepeatTimes" in first["s1_properties_error"]
+    second = await coord._async_update_data_s1()
+    assert second["s1_properties_error"] is None
+    assert second["clean_mode"]["times"] == 2
 
 
 async def test_new_s1_clients_share_the_in_memory_sdk_session():
